@@ -1,0 +1,28 @@
+run_id: gri30_tiny_quick
+
+baseline:
+  mechanism: ../assets/mechanisms/gri30.yaml
+  phase: gri30
+
+candidate:
+  mechanism: ../assets/mechanisms/gri30.yaml
+
+conditions_csv: ../assets/conditions/gri30_tiny.csv
+
+mixture:
+  fuel: CH4:1.0
+  oxidizer: O2:1.0, N2:3.76
+
+integration:
+  n_steps: 120
+
+qoi:
+  species_last: [CO2, CO, H2O, CH4, O2, NO, NO2]
+  species_max: [OH, HO2]
+
+evaluation:
+  rel_tolerance: 0.20
+  rel_eps: 1.0e-12
+
+output:
+  root: ../runs
