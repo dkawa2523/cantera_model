@@ -1,0 +1,46 @@
+name: smoke
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  tiny-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tiny smoke
+        run: |
+          python run_cantera_eval.py \
+            --config configs/gri30_tiny_quick.yaml \
+            --run-id ci_tiny_smoke
+
+      - name: Validate summary
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          summary_path = Path("runs/ci_tiny_smoke/summary.json")
+          data = json.loads(summary_path.read_text())
+          if data.get("status") != "ok":
+              raise SystemExit(f"status is not ok: {data.get('status')}")
+          comp = data.get("comparison") or {}
+          if float(comp.get("pass_rate", 0.0)) < 1.0:
+              raise SystemExit(f"pass_rate must be 1.0 in tiny smoke: {comp.get('pass_rate')}")
+          print("smoke ok")
+          PY
+

@@ -92,6 +92,24 @@ python run_cantera_eval.py \
   --run-id custom_compare_run
 ```
 
+### candidate 機構ファイルの置き場所例
+推奨は、このリポジトリ直下に `models/` を作って置く方法です。
+
+```bash
+mkdir -p models
+cp /path/to/reduced_gri30.yaml models/reduced_gri30.yaml
+
+./run_compare.sh \
+  --run-id compare_reduced \
+  --candidate-mechanism models/reduced_gri30.yaml
+```
+
+`assets/mechanisms/` に置いて比較しても問題ありません。
+```bash
+cp /path/to/reduced_gri30.yaml assets/mechanisms/reduced_gri30.yaml
+./run_compare.sh --candidate-mechanism assets/mechanisms/reduced_gri30.yaml
+```
+
 ## 出力
 `runs/<run_id>/` に出力されます。
 - `summary.json`: 実行サマリ（種数・反応数・比較指標）
