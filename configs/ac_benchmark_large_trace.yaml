@@ -1,0 +1,19 @@
+run_id: ac_benchmark_large_trace
+
+simulation:
+  mode: surface_batch
+  surface:
+    mechanism: ../cantera_model/benchmark_large/mechanisms/ac_hydrocarbon_cvd_large__gri30.yaml
+    interface_phase: ac_surf
+    gas_phase: gas
+    pressure_unit: torr
+    include_gas_reactions_in_trace: true
+    trace_wdot_policy: stoich_consistent
+
+conditions_csv: ../cantera_model/benchmark_large/benchmarks/ac_hydrocarbon_cvd_large/conditions.csv
+
+integration:
+  n_steps: 60
+
+trace_output:
+  root: ../artifacts/traces

@@ -1,0 +1,122 @@
+run_id: reduce_surrogate_aggressive
+
+conditions_csv: assets/conditions/gri30_tiny.csv
+report_dir: reports
+# network_dir: artifacts/network/<run_id>   # optional: if set, prebuilt nu/A/F_bar/rop/wdot are used
+# trace_h5: artifacts/traces/<run_id>.h5  # optional: if set, real trace data is used
+
+qoi:
+  species_last: [CO2, CO, H2O, CH4, O2]
+  species_max: [OH, HO2]
+
+evaluation:
+  rel_tolerance: 0.40
+  rel_eps: 1.0e-12
+  surrogate_split:
+    mode: kfold
+    kfolds: 2
+  physical_gate:
+    enabled: true
+    max_conservation_violation: 5.0e-3
+    max_negative_steps: 0
+
+surrogate:
+  model: linear_ridge
+  l2: 1.0e-6
+  perturb_gain: 1.0
+  blend_reference: 0.0
+
+gate:
+  min_pass_rate: 0.75
+  max_mean_rel_diff: 0.40
+  max_conservation_violation: 0.0
+
+merge:
+  # network_dir mode only:
+  # phase_weights: {pulse: 1.0, purge: 0.0}
+  # phase_select: pulse
+  # note: phase_weights and phase_select are mutually exclusive
+  hard:
+    element_overlap_required: true
+  overlap_method: jaccard
+  soft:
+    penalty:
+      phase: 0.80
+      charge: 0.80
+      radical: 0.40
+      role: 0.30
+  weights:
+    elem: 1.0
+    frag: 0.8
+    flux: 1.2
+    role: 0.5
+  species_meta:
+    - name: CH4
+      composition: {C: 1, H: 4}
+      phase: gas
+      charge: 0
+      radical: false
+      role: fuel
+    - name: CH
+      composition: {C: 1, H: 1}
+      phase: gas
+      charge: 0
+      radical: true
+      role: fuel
+    - name: CF4
+      composition: {C: 1, F: 4}
+      phase: gas
+      charge: 0
+      radical: false
+      role: etch
+    - name: F
+      composition: {F: 1}
+      phase: gas
+      charge: 0
+      radical: true
+      role: etch
+    - name: N
+      composition: {N: 1}
+      phase: gas
+      charge: 0
+      radical: true
+      role: carrier
+    - name: H
+      composition: {H: 1}
+      phase: gas
+      charge: 0
+      radical: true
+      role: carrier
+
+synthetic:
+  n_reactions: 24
+
+search:
+  seed: 7
+  merge_search:
+    min_pair_score: -0.50
+  stages:
+    - name: A
+      target_ratio: 0.75
+      penalty_scale: 1.00
+      prune_lambda: 0.001
+      prune_keep_ratio: 0.90
+      prune_threshold: 0.45
+      prune_exact_keep: true
+      metric_drift: 1.02
+    - name: B
+      target_ratio: 0.55
+      penalty_scale: 0.70
+      prune_lambda: 0.004
+      prune_keep_ratio: 0.70
+      prune_threshold: 0.40
+      prune_exact_keep: true
+      metric_drift: 1.08
+    - name: C
+      target_ratio: 0.35
+      penalty_scale: 0.40
+      prune_lambda: 0.010
+      prune_keep_ratio: 0.50
+      prune_threshold: 0.35
+      prune_exact_keep: true
+      metric_drift: 1.15

@@ -1,0 +1,107 @@
+run_id: reduce_surrogate_aggressive
+conditions_csv: assets/conditions/gri30_tiny.csv
+report_dir: reports
+qoi:
+  species_last:
+  - CO2
+  - CO
+  - H2O
+  - CH4
+  - O2
+  species_max:
+  - OH
+  - HO2
+evaluation:
+  rel_tolerance: 0.4
+  rel_eps: 1.0e-12
+gate:
+  min_pass_rate: 0.75
+  max_mean_rel_diff: 0.4
+  max_conservation_violation: 0.0
+merge:
+  hard:
+    element_overlap_required: true
+  overlap_method: jaccard
+  soft:
+    penalty:
+      phase: 0.8
+      charge: 0.8
+      radical: 0.4
+      role: 0.3
+  weights:
+    elem: 1.0
+    frag: 0.8
+    flux: 1.2
+    role: 0.5
+  species_meta:
+  - name: CH4
+    composition:
+      C: 1
+      H: 4
+    phase: gas
+    charge: 0
+    radical: false
+    role: fuel
+  - name: CH
+    composition:
+      C: 1
+      H: 1
+    phase: gas
+    charge: 0
+    radical: true
+    role: fuel
+  - name: CF4
+    composition:
+      C: 1
+      F: 4
+    phase: gas
+    charge: 0
+    radical: false
+    role: etch
+  - name: F
+    composition:
+      F: 1
+    phase: gas
+    charge: 0
+    radical: true
+    role: etch
+  - name: N
+    composition:
+      N: 1
+    phase: gas
+    charge: 0
+    radical: true
+    role: carrier
+  - name: H
+    composition:
+      H: 1
+    phase: gas
+    charge: 0
+    radical: true
+    role: carrier
+synthetic:
+  n_reactions: 24
+search:
+  seed: 7
+  merge_search:
+    min_pair_score: -0.5
+  stages:
+  - name: A
+    target_ratio: 0.75
+    penalty_scale: 1.0
+    prune_lambda: 0.001
+    prune_keep_ratio: 0.9
+    metric_drift: 1.02
+  - name: B
+    target_ratio: 0.55
+    penalty_scale: 0.7
+    prune_lambda: 0.004
+    prune_keep_ratio: 0.7
+    metric_drift: 1.08
+  - name: C
+    target_ratio: 0.35
+    penalty_scale: 0.4
+    prune_lambda: 0.01
+    prune_keep_ratio: 0.5
+    metric_drift: 1.15
+trace_h5: artifacts/traces/next_impl_trace.h5

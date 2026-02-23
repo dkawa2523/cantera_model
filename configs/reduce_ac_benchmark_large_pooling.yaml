@@ -1,0 +1,198 @@
+run_id: reduce_ac_benchmark_large_pooling
+
+report_dir: reports
+trace_h5: artifacts/traces/ac_benchmark_large_trace.h5
+
+reduction:
+  mode: pooling
+
+qoi:
+  species_last: [H2, C2H2, X_T(s), C_bulk]
+  species_max: [H, CH3, H_T(s)]
+  species_integral: [H2, C2H2, H_T(s)]
+  deposition_integral: [C_bulk, C_D(s)]
+
+evaluation:
+  rel_tolerance: 0.40
+  rel_eps: 1.0e-12
+  surrogate_split:
+    mode: adaptive_kfold
+    kfold_policy:
+      min_cases_for_kfold: 4
+      default_k: 2
+      k_by_case_count: {6: 3, 8: 3}
+  physical_gate:
+    enabled: true
+    max_conservation_violation: 5.0e-3
+    max_negative_steps: 0
+
+surrogate:
+  model: linear_ridge
+  l2: 1.0e-6
+  perturb_gain: 1.0
+  blend_reference: 0.0
+
+gate:
+  min_pass_rate: 0.75
+  max_mean_rel_diff: 0.40
+  max_conservation_violation: 0.005
+
+selection:
+  policy: pass_first_pareto
+  tie_breakers: [reaction_reduction, species_reduction, mean_rel_diff]
+  weights:
+    err: 0.55
+    reaction_comp: 0.30
+    species_comp: 0.10
+    floor_margin: 0.05
+    balance_margin: 0.05
+    coverage_margin: 0.05
+    cluster_size_margin: 0.03
+
+balance_constraints:
+  enabled: true
+  balance_mode: hybrid
+  min_reaction_species_ratio: 0.30
+  max_reaction_species_ratio: 6.00
+  min_active_species_coverage: 0.40
+  min_weighted_active_species_coverage: 0.80
+  min_active_species_coverage_top_weighted: 0.80
+  min_essential_species_coverage: 0.80
+  max_cluster_size_ratio: 0.45
+  min_nu_rank_ratio: 0.30
+  essential_species: [H2, C2H2, X_T(s), C_bulk, H, CH3, H_T(s)]
+  activity_weights:
+    x: 0.25
+    wdot: 0.55
+    flux: 0.20
+  dynamic:
+    enabled: true
+    complexity_offset_reactions: 100
+    complexity_span_reactions: 300
+    complexity_min: 0.0
+    complexity_max: 1.0
+    rules:
+      min_reaction_species_ratio:
+        slope: -0.04
+        floor: 0.24
+      max_reaction_species_ratio:
+        slope: 1.50
+        ceiling: 8.00
+      min_active_species_coverage:
+        slope: -0.08
+        floor: 0.32
+
+physics_constraints:
+  phase_mixing_forbidden: true
+  surface_site_family_strict: true
+  nonnegative_required: true
+
+physics_floors:
+  min_reactions_abs: 12
+  min_reactions_ratio: 0.03
+  min_species_abs: 8
+  min_species_ratio: 0.08
+
+merge:
+  hard:
+    element_overlap_required: true
+  overlap_method: jaccard
+  soft:
+    penalty:
+      phase: 0.80
+      charge: 0.80
+      radical: 0.40
+      role: 0.30
+  weights:
+    elem: 1.0
+    frag: 0.8
+    flux: 1.2
+    role: 0.5
+
+search:
+  seed: 7
+  merge_search:
+    min_pair_score: -0.50
+  stages:
+    - name: A
+      target_ratio: 0.75
+      penalty_scale: 1.00
+      prune_lambda: 0.001
+      prune_keep_ratio: 0.90
+      prune_threshold: 0.45
+      prune_exact_keep: true
+      metric_drift: 1.02
+    - name: B
+      target_ratio: 0.55
+      penalty_scale: 0.70
+      prune_lambda: 0.004
+      prune_keep_ratio: 0.70
+      prune_threshold: 0.40
+      prune_exact_keep: true
+      metric_drift: 1.08
+    - name: C
+      target_ratio: 0.35
+      penalty_scale: 0.40
+      prune_lambda: 0.010
+      prune_keep_ratio: 0.50
+      prune_threshold: 0.35
+      prune_exact_keep: true
+      metric_drift: 1.15
+
+pooling:
+  graph: species
+  artifact_dir: artifacts/pooling
+  fallback_to_rule_based_on_error: true
+  graph_cfg: {}
+  feature_cfg: {}
+  constraint_cfg:
+    hard:
+      element_overlap_required: true
+      same_phase_required: false
+      phase_mixing_forbidden: true
+      surface_site_family_strict: true
+    soft:
+      penalty:
+        phase: 0.8
+        charge: 0.8
+        radical: 0.4
+        role: 0.3
+  constraints:
+    hard_weight: 10.0
+    soft_weight: 1.0
+  model:
+    backend: pyg
+    seed: 7
+    hidden_dim: 16
+  train:
+    temperature: 0.7
+    min_clusters: 8
+    min_active_clusters: 8
+    coverage_target: 0.50
+    coverage_max_clusters: 20
+    max_cluster_size_ratio: 0.45
+
+learnckpp:
+  fallback_to_baseline_on_error: true
+  candidate:
+    max_candidates: 256
+    min_flux_quantile: 0.70
+    min_candidates_floor: 18
+  select:
+    method: hard_concrete
+    lambda_l0: 1.0e-3
+    target_keep_ratio: 0.30
+    min_keep_count: 13
+  coverage_postselect:
+    enabled: true
+    target_weighted_coverage: 0.80
+    target_essential_coverage: 0.80
+  rate:
+    model: log_linear
+    l2: 1.0e-6
+  projection:
+    enabled: true
+    max_iter: 4
+  fallback:
+    select_method: l1_threshold
+    threshold_quantile: 0.75

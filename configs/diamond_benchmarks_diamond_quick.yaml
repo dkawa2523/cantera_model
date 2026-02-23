@@ -1,0 +1,32 @@
+run_id: diamond_benchmarks_diamond_quick
+
+simulation:
+  mode: surface_batch
+  surface:
+    interface_phase: diamond_100
+    gas_phase: gas
+    pressure_unit: atm
+
+baseline:
+  mechanism: diamond.yaml
+
+candidate:
+  mechanism: diamond.yaml
+
+conditions_csv: ../cantera_model/benchmarks_diamond/benchmarks/diamond_cvd/conditions.csv
+
+integration:
+  n_steps: 120
+
+evaluation:
+  rel_tolerance: 0.25
+  rel_eps: 1.0e-12
+  qoi:
+    selectors:
+      - gas_X:H2:final
+      - gas_X:CH4:final
+      - surface_theta:c6HH:final
+      - deposition_rate:C(d):mean
+
+output:
+  root: ../runs

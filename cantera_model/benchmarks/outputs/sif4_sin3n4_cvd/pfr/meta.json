@@ -1,0 +1,15 @@
+{
+  "mech_path": "/Volumes/SP PX10/Main_code/cantera_model-main/cantera_model/benchmarks/cantera_cvd_ald_benchmarks_pack/mechanisms/SiF4_NH3_mec.yaml",
+  "interface": "SI3N4",
+  "T": 1713.0,
+  "P_torr": 2.0,
+  "X": "SiF4:0.1427, NH3:0.8573",
+  "tube_d": 0.0508,
+  "u0": 11.53,
+  "x_end": 0.6,
+  "steps": 399,
+  "gas_n_species": 17,
+  "gas_n_reactions": 33,
+  "surf_n_species": 6,
+  "surf_n_reactions": 6
+}

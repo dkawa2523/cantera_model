@@ -1,0 +1,16 @@
+run_id: tune_pooling
+
+base_config: configs/reduce_pooling_mvp.yaml
+output_root: reports/tuning_pooling
+max_trials: 8
+
+pooling_tuning:
+  seed: 7
+  graph_choices: [species, bipartite]
+  backend_choices: [pyg, numpy]
+  temperature_range: [0.5, 1.0]
+  ratio_scale_range: [0.85, 1.15]
+  penalty_phase_range: [0.4, 1.4]
+  penalty_charge_range: [0.4, 1.4]
+  penalty_radical_range: [0.1, 0.9]
+  penalty_role_range: [0.1, 0.9]

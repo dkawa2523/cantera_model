@@ -1,0 +1,1629 @@
+description: "Large amorphous-carbon CVD benchmark (gas+surface) for Cantera.\n\nPurpose\n-------\nBenchmark for reaction-network\
+  \ analysis and mechanism reduction with:\n  - Gas phase: very large published combustion mechanism (n-hexane NUIG 2015)\
+  \ to ensure\n    species >= 100 and reactions >= 500 (in practice: 1268 species in Cantera's example).\n  - Surface phase:\
+  \ synthetic but mass-balanced microkinetic-like scheme for hydrocarbon-derived\n    carbon film growth, expanded across\
+  \ multiple site families to ensure\n    surface species >= 20 and surface reactions >= 100.\n\nNotes\n-----\n- Surface species\
+  \ thermochemistry is set to zeros (NASA7) because this benchmark is intended\n  primarily for kinetics / network-structure\
+  \ reduction (not equilibrium).\n- All surface reactions are written as irreversible (=>) to avoid reliance on surface thermo.\n\
+  - Rate parameters are order-of-magnitude plausible (TST / sticking coefficient constraints),\n  but are not tuned to any\
+  \ specific reactor or material.\n\n"
+generator: cantera_semicon_benchmark_builder (ChatGPT)
+date: '2026-02-21'
+units:
+  length: cm
+  quantity: mol
+  activation-energy: J/mol
+phases:
+- name: gas
+  thermo: ideal-gas
+  elements:
+  - H
+  - O
+  - C
+  - N
+  species:
+  - example_data/n-hexane-NUIG-2015.yaml/species: all
+  kinetics: gas
+  reactions:
+  - example_data/n-hexane-NUIG-2015.yaml/reactions: all
+  transport: mixture-averaged
+  state:
+    T: 1000.0
+    P: 101325.0
+    X:
+      H2: 0.95
+      C2H2: 0.05
+- name: carbon_bulk
+  thermo: fixed-stoichiometry
+  species:
+  - bulk-species:
+    - C_bulk
+- name: ac_surf
+  thermo: ideal-surface
+  adjacent-phases:
+  - gas
+  - carbon_bulk
+  species:
+  - surf-species: all
+  kinetics: surface
+  reactions: all
+  site-density: 3.0e-09 mol/cm^2
+  state:
+    T: 1000.0
+    coverages:
+      X_T(s): 0.25
+      X_S(s): 0.25
+      X_K(s): 0.25
+      X_D(s): 0.25
+bulk-species:
+- name: C_bulk
+  composition:
+    C: 1
+  thermo:
+    model: constant-cp
+  equation-of-state:
+    model: constant-volume
+    density: 2.0 g/cm^3
+  note: Bulk carbon film (lumped). Density set to a typical amorphous carbon order-of-magnitude.
+surf-species:
+- name: X_T(s)
+  composition:
+    C: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+  note: empty site (lattice C)
+- name: H_T(s)
+  composition:
+    C: 1
+    H: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+  note: H-terminated site
+- name: CH3_T(s)
+  composition:
+    C: 2
+    H: 3
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: CH2_T(s)
+  composition:
+    C: 2
+    H: 2
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: CH_T(s)
+  composition:
+    C: 2
+    H: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C_T(s)
+  composition:
+    C: 2
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2H4_T(s)
+  composition:
+    C: 3
+    H: 4
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2H2_T(s)
+  composition:
+    C: 3
+    H: 2
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2H_T(s)
+  composition:
+    C: 3
+    H: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2_T(s)
+  composition:
+    C: 3
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: X_S(s)
+  composition:
+    C: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+  note: empty site (lattice C)
+- name: H_S(s)
+  composition:
+    C: 1
+    H: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+  note: H-terminated site
+- name: CH3_S(s)
+  composition:
+    C: 2
+    H: 3
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: CH2_S(s)
+  composition:
+    C: 2
+    H: 2
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: CH_S(s)
+  composition:
+    C: 2
+    H: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C_S(s)
+  composition:
+    C: 2
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2H4_S(s)
+  composition:
+    C: 3
+    H: 4
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2H2_S(s)
+  composition:
+    C: 3
+    H: 2
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2H_S(s)
+  composition:
+    C: 3
+    H: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2_S(s)
+  composition:
+    C: 3
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: X_K(s)
+  composition:
+    C: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+  note: empty site (lattice C)
+- name: H_K(s)
+  composition:
+    C: 1
+    H: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+  note: H-terminated site
+- name: CH3_K(s)
+  composition:
+    C: 2
+    H: 3
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: CH2_K(s)
+  composition:
+    C: 2
+    H: 2
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: CH_K(s)
+  composition:
+    C: 2
+    H: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C_K(s)
+  composition:
+    C: 2
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2H4_K(s)
+  composition:
+    C: 3
+    H: 4
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2H2_K(s)
+  composition:
+    C: 3
+    H: 2
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2H_K(s)
+  composition:
+    C: 3
+    H: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2_K(s)
+  composition:
+    C: 3
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: X_D(s)
+  composition:
+    C: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+  note: empty site (lattice C)
+- name: H_D(s)
+  composition:
+    C: 1
+    H: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+  note: H-terminated site
+- name: CH3_D(s)
+  composition:
+    C: 2
+    H: 3
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: CH2_D(s)
+  composition:
+    C: 2
+    H: 2
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: CH_D(s)
+  composition:
+    C: 2
+    H: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C_D(s)
+  composition:
+    C: 2
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2H4_D(s)
+  composition:
+    C: 3
+    H: 4
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2H2_D(s)
+  composition:
+    C: 3
+    H: 2
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2H_D(s)
+  composition:
+    C: 3
+    H: 1
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+- name: C2_D(s)
+  composition:
+    C: 3
+  thermo:
+    model: NASA7
+    temperature-ranges:
+    - 200.0
+    - 1000.0
+    - 3500.0
+    data:
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+      - 0.0
+reactions:
+- equation: H + X_T(s) => H_T(s)
+  sticking-coefficient:
+    A: 0.3
+    b: 0.0
+    Ea: 0.0
+  sticking-species: H
+  note: H adsorption on site T
+- equation: H2 + 2 X_T(s) => 2 H_T(s)
+  sticking-coefficient:
+    A: 0.05
+    b: 0.0
+    Ea: 0.0
+  sticking-species: H2
+  note: H2 dissociative adsorption on site T
+- equation: CH4 + X_T(s) => CH3_T(s) + H
+  sticking-coefficient:
+    A: 1.0e-06
+    b: 0.0
+    Ea: 50000.0
+  sticking-species: CH4
+  note: CH4 dissociation (methyl formation) on site T
+- equation: C2H2 + X_T(s) => C2H2_T(s)
+  sticking-coefficient:
+    A: 0.02
+    b: 0.0
+    Ea: 0.0
+  sticking-species: C2H2
+  note: C2H2 adsorption on site T
+- equation: C2H4 + X_T(s) => C2H4_T(s)
+  sticking-coefficient:
+    A: 0.01
+    b: 0.0
+    Ea: 0.0
+  sticking-species: C2H4
+  note: C2H4 adsorption on site T
+- equation: 2 H_T(s) => H2 + 2 X_T(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 0.0
+  note: H recombination / desorption on site T
+- equation: C2H4_T(s) => C2H4 + X_T(s)
+  rate-constant:
+    A: 1.0e13 1/s
+    b: 0.0
+    Ea: 60000.0
+  note: C2H4 desorption on site T
+- equation: C2H2_T(s) => C2H2 + X_T(s)
+  rate-constant:
+    A: 1.0e13 1/s
+    b: 0.0
+    Ea: 80000.0
+  note: C2H2 desorption on site T
+- equation: CH3_T(s) + H_T(s) => CH4 + 2 X_T(s)
+  rate-constant:
+    A: 5.0e20 cm^2/mol/s
+    b: 0.0
+    Ea: 20000.0
+  note: CH3 hydrogenation to CH4 on site T
+- equation: CH3_T(s) + X_T(s) => CH2_T(s) + H_T(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 70000.0
+- equation: CH2_T(s) + X_T(s) => CH_T(s) + H_T(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 80000.0
+- equation: CH_T(s) + X_T(s) => C_T(s) + H_T(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 90000.0
+- equation: CH2_T(s) + H_T(s) => CH3_T(s) + X_T(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 20000.0
+- equation: CH_T(s) + H_T(s) => CH2_T(s) + X_T(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 20000.0
+- equation: C_T(s) + H_T(s) => CH_T(s) + X_T(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 25000.0
+- equation: C2H2_T(s) + X_T(s) => C2H_T(s) + H_T(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 60000.0
+- equation: C2H_T(s) + X_T(s) => C2_T(s) + H_T(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 70000.0
+- equation: C2H_T(s) + H_T(s) => C2H2_T(s) + X_T(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 15000.0
+- equation: C2_T(s) + H_T(s) => C2H_T(s) + X_T(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 15000.0
+- equation: C2H4_T(s) => C2H2_T(s) + H2
+  rate-constant:
+    A: 1.0e13 1/s
+    b: 0.0
+    Ea: 100000.0
+  note: C2H4 dehydrogenation (net) on site T
+- equation: C_T(s) => C_bulk + X_T(s)
+  rate-constant:
+    A: 5.0e12 1/s
+    b: 0.0
+    Ea: 10000.0
+  note: incorporation of C adatom into bulk on site T
+- equation: CH_T(s) => C_bulk + H + X_T(s)
+  rate-constant:
+    A: 5.0e12 1/s
+    b: 0.0
+    Ea: 15000.0
+- equation: CH2_T(s) => C_bulk + H2 + X_T(s)
+  rate-constant:
+    A: 5.0e12 1/s
+    b: 0.0
+    Ea: 15000.0
+- equation: C2_T(s) => 2 C_bulk + X_T(s)
+  rate-constant:
+    A: 1.0e12 1/s
+    b: 0.0
+    Ea: 5000.0
+- equation: C2H2_T(s) => 2 C_bulk + H2 + X_T(s)
+  rate-constant:
+    A: 1.0e12 1/s
+    b: 0.0
+    Ea: 20000.0
+- equation: H + X_S(s) => H_S(s)
+  sticking-coefficient:
+    A: 0.3
+    b: 0.0
+    Ea: 0.0
+  sticking-species: H
+  note: H adsorption on site S
+- equation: H2 + 2 X_S(s) => 2 H_S(s)
+  sticking-coefficient:
+    A: 0.05
+    b: 0.0
+    Ea: 0.0
+  sticking-species: H2
+  note: H2 dissociative adsorption on site S
+- equation: CH4 + X_S(s) => CH3_S(s) + H
+  sticking-coefficient:
+    A: 1.0e-06
+    b: 0.0
+    Ea: 52000.0
+  sticking-species: CH4
+  note: CH4 dissociation (methyl formation) on site S
+- equation: C2H2 + X_S(s) => C2H2_S(s)
+  sticking-coefficient:
+    A: 0.02
+    b: 0.0
+    Ea: 0.0
+  sticking-species: C2H2
+  note: C2H2 adsorption on site S
+- equation: C2H4 + X_S(s) => C2H4_S(s)
+  sticking-coefficient:
+    A: 0.01
+    b: 0.0
+    Ea: 0.0
+  sticking-species: C2H4
+  note: C2H4 adsorption on site S
+- equation: 2 H_S(s) => H2 + 2 X_S(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 2000.0
+  note: H recombination / desorption on site S
+- equation: C2H4_S(s) => C2H4 + X_S(s)
+  rate-constant:
+    A: 1.0e13 1/s
+    b: 0.0
+    Ea: 62000.0
+  note: C2H4 desorption on site S
+- equation: C2H2_S(s) => C2H2 + X_S(s)
+  rate-constant:
+    A: 1.0e13 1/s
+    b: 0.0
+    Ea: 82000.0
+  note: C2H2 desorption on site S
+- equation: CH3_S(s) + H_S(s) => CH4 + 2 X_S(s)
+  rate-constant:
+    A: 5.0e20 cm^2/mol/s
+    b: 0.0
+    Ea: 22000.0
+  note: CH3 hydrogenation to CH4 on site S
+- equation: CH3_S(s) + X_S(s) => CH2_S(s) + H_S(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 72000.0
+- equation: CH2_S(s) + X_S(s) => CH_S(s) + H_S(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 82000.0
+- equation: CH_S(s) + X_S(s) => C_S(s) + H_S(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 92000.0
+- equation: CH2_S(s) + H_S(s) => CH3_S(s) + X_S(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 22000.0
+- equation: CH_S(s) + H_S(s) => CH2_S(s) + X_S(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 22000.0
+- equation: C_S(s) + H_S(s) => CH_S(s) + X_S(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 27000.0
+- equation: C2H2_S(s) + X_S(s) => C2H_S(s) + H_S(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 62000.0
+- equation: C2H_S(s) + X_S(s) => C2_S(s) + H_S(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 72000.0
+- equation: C2H_S(s) + H_S(s) => C2H2_S(s) + X_S(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 17000.0
+- equation: C2_S(s) + H_S(s) => C2H_S(s) + X_S(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 17000.0
+- equation: C2H4_S(s) => C2H2_S(s) + H2
+  rate-constant:
+    A: 1.0e13 1/s
+    b: 0.0
+    Ea: 102000.0
+  note: C2H4 dehydrogenation (net) on site S
+- equation: C_S(s) => C_bulk + X_S(s)
+  rate-constant:
+    A: 5.0e12 1/s
+    b: 0.0
+    Ea: 12000.0
+  note: incorporation of C adatom into bulk on site S
+- equation: CH_S(s) => C_bulk + H + X_S(s)
+  rate-constant:
+    A: 5.0e12 1/s
+    b: 0.0
+    Ea: 17000.0
+- equation: CH2_S(s) => C_bulk + H2 + X_S(s)
+  rate-constant:
+    A: 5.0e12 1/s
+    b: 0.0
+    Ea: 17000.0
+- equation: C2_S(s) => 2 C_bulk + X_S(s)
+  rate-constant:
+    A: 1.0e12 1/s
+    b: 0.0
+    Ea: 7000.0
+- equation: C2H2_S(s) => 2 C_bulk + H2 + X_S(s)
+  rate-constant:
+    A: 1.0e12 1/s
+    b: 0.0
+    Ea: 22000.0
+- equation: H + X_K(s) => H_K(s)
+  sticking-coefficient:
+    A: 0.3
+    b: 0.0
+    Ea: 0.0
+  sticking-species: H
+  note: H adsorption on site K
+- equation: H2 + 2 X_K(s) => 2 H_K(s)
+  sticking-coefficient:
+    A: 0.05
+    b: 0.0
+    Ea: 0.0
+  sticking-species: H2
+  note: H2 dissociative adsorption on site K
+- equation: CH4 + X_K(s) => CH3_K(s) + H
+  sticking-coefficient:
+    A: 1.0e-06
+    b: 0.0
+    Ea: 54000.0
+  sticking-species: CH4
+  note: CH4 dissociation (methyl formation) on site K
+- equation: C2H2 + X_K(s) => C2H2_K(s)
+  sticking-coefficient:
+    A: 0.02
+    b: 0.0
+    Ea: 0.0
+  sticking-species: C2H2
+  note: C2H2 adsorption on site K
+- equation: C2H4 + X_K(s) => C2H4_K(s)
+  sticking-coefficient:
+    A: 0.01
+    b: 0.0
+    Ea: 0.0
+  sticking-species: C2H4
+  note: C2H4 adsorption on site K
+- equation: 2 H_K(s) => H2 + 2 X_K(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 4000.0
+  note: H recombination / desorption on site K
+- equation: C2H4_K(s) => C2H4 + X_K(s)
+  rate-constant:
+    A: 1.0e13 1/s
+    b: 0.0
+    Ea: 64000.0
+  note: C2H4 desorption on site K
+- equation: C2H2_K(s) => C2H2 + X_K(s)
+  rate-constant:
+    A: 1.0e13 1/s
+    b: 0.0
+    Ea: 84000.0
+  note: C2H2 desorption on site K
+- equation: CH3_K(s) + H_K(s) => CH4 + 2 X_K(s)
+  rate-constant:
+    A: 5.0e20 cm^2/mol/s
+    b: 0.0
+    Ea: 24000.0
+  note: CH3 hydrogenation to CH4 on site K
+- equation: CH3_K(s) + X_K(s) => CH2_K(s) + H_K(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 74000.0
+- equation: CH2_K(s) + X_K(s) => CH_K(s) + H_K(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 84000.0
+- equation: CH_K(s) + X_K(s) => C_K(s) + H_K(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 94000.0
+- equation: CH2_K(s) + H_K(s) => CH3_K(s) + X_K(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 24000.0
+- equation: CH_K(s) + H_K(s) => CH2_K(s) + X_K(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 24000.0
+- equation: C_K(s) + H_K(s) => CH_K(s) + X_K(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 29000.0
+- equation: C2H2_K(s) + X_K(s) => C2H_K(s) + H_K(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 64000.0
+- equation: C2H_K(s) + X_K(s) => C2_K(s) + H_K(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 74000.0
+- equation: C2H_K(s) + H_K(s) => C2H2_K(s) + X_K(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 19000.0
+- equation: C2_K(s) + H_K(s) => C2H_K(s) + X_K(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 19000.0
+- equation: C2H4_K(s) => C2H2_K(s) + H2
+  rate-constant:
+    A: 1.0e13 1/s
+    b: 0.0
+    Ea: 104000.0
+  note: C2H4 dehydrogenation (net) on site K
+- equation: C_K(s) => C_bulk + X_K(s)
+  rate-constant:
+    A: 5.0e12 1/s
+    b: 0.0
+    Ea: 14000.0
+  note: incorporation of C adatom into bulk on site K
+- equation: CH_K(s) => C_bulk + H + X_K(s)
+  rate-constant:
+    A: 5.0e12 1/s
+    b: 0.0
+    Ea: 19000.0
+- equation: CH2_K(s) => C_bulk + H2 + X_K(s)
+  rate-constant:
+    A: 5.0e12 1/s
+    b: 0.0
+    Ea: 19000.0
+- equation: C2_K(s) => 2 C_bulk + X_K(s)
+  rate-constant:
+    A: 1.0e12 1/s
+    b: 0.0
+    Ea: 9000.0
+- equation: C2H2_K(s) => 2 C_bulk + H2 + X_K(s)
+  rate-constant:
+    A: 1.0e12 1/s
+    b: 0.0
+    Ea: 24000.0
+- equation: H + X_D(s) => H_D(s)
+  sticking-coefficient:
+    A: 0.3
+    b: 0.0
+    Ea: 0.0
+  sticking-species: H
+  note: H adsorption on site D
+- equation: H2 + 2 X_D(s) => 2 H_D(s)
+  sticking-coefficient:
+    A: 0.05
+    b: 0.0
+    Ea: 0.0
+  sticking-species: H2
+  note: H2 dissociative adsorption on site D
+- equation: CH4 + X_D(s) => CH3_D(s) + H
+  sticking-coefficient:
+    A: 1.0e-06
+    b: 0.0
+    Ea: 56000.0
+  sticking-species: CH4
+  note: CH4 dissociation (methyl formation) on site D
+- equation: C2H2 + X_D(s) => C2H2_D(s)
+  sticking-coefficient:
+    A: 0.02
+    b: 0.0
+    Ea: 0.0
+  sticking-species: C2H2
+  note: C2H2 adsorption on site D
+- equation: C2H4 + X_D(s) => C2H4_D(s)
+  sticking-coefficient:
+    A: 0.01
+    b: 0.0
+    Ea: 0.0
+  sticking-species: C2H4
+  note: C2H4 adsorption on site D
+- equation: 2 H_D(s) => H2 + 2 X_D(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 6000.0
+  note: H recombination / desorption on site D
+- equation: C2H4_D(s) => C2H4 + X_D(s)
+  rate-constant:
+    A: 1.0e13 1/s
+    b: 0.0
+    Ea: 66000.0
+  note: C2H4 desorption on site D
+- equation: C2H2_D(s) => C2H2 + X_D(s)
+  rate-constant:
+    A: 1.0e13 1/s
+    b: 0.0
+    Ea: 86000.0
+  note: C2H2 desorption on site D
+- equation: CH3_D(s) + H_D(s) => CH4 + 2 X_D(s)
+  rate-constant:
+    A: 5.0e20 cm^2/mol/s
+    b: 0.0
+    Ea: 26000.0
+  note: CH3 hydrogenation to CH4 on site D
+- equation: CH3_D(s) + X_D(s) => CH2_D(s) + H_D(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 76000.0
+- equation: CH2_D(s) + X_D(s) => CH_D(s) + H_D(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 86000.0
+- equation: CH_D(s) + X_D(s) => C_D(s) + H_D(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 96000.0
+- equation: CH2_D(s) + H_D(s) => CH3_D(s) + X_D(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 26000.0
+- equation: CH_D(s) + H_D(s) => CH2_D(s) + X_D(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 26000.0
+- equation: C_D(s) + H_D(s) => CH_D(s) + X_D(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 31000.0
+- equation: C2H2_D(s) + X_D(s) => C2H_D(s) + H_D(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 66000.0
+- equation: C2H_D(s) + X_D(s) => C2_D(s) + H_D(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 76000.0
+- equation: C2H_D(s) + H_D(s) => C2H2_D(s) + X_D(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 21000.0
+- equation: C2_D(s) + H_D(s) => C2H_D(s) + X_D(s)
+  rate-constant:
+    A: 1.0e21 cm^2/mol/s
+    b: 0.0
+    Ea: 21000.0
+- equation: C2H4_D(s) => C2H2_D(s) + H2
+  rate-constant:
+    A: 1.0e13 1/s
+    b: 0.0
+    Ea: 106000.0
+  note: C2H4 dehydrogenation (net) on site D
+- equation: C_D(s) => C_bulk + X_D(s)
+  rate-constant:
+    A: 5.0e12 1/s
+    b: 0.0
+    Ea: 16000.0
+  note: incorporation of C adatom into bulk on site D
+- equation: CH_D(s) => C_bulk + H + X_D(s)
+  rate-constant:
+    A: 5.0e12 1/s
+    b: 0.0
+    Ea: 21000.0
+- equation: CH2_D(s) => C_bulk + H2 + X_D(s)
+  rate-constant:
+    A: 5.0e12 1/s
+    b: 0.0
+    Ea: 21000.0
+- equation: C2_D(s) => 2 C_bulk + X_D(s)
+  rate-constant:
+    A: 1.0e12 1/s
+    b: 0.0
+    Ea: 11000.0
+- equation: C2H2_D(s) => 2 C_bulk + H2 + X_D(s)
+  rate-constant:
+    A: 1.0e12 1/s
+    b: 0.0
+    Ea: 26000.0
