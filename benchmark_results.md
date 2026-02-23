@@ -24,24 +24,45 @@ large系3ベンチマーク（`benchmarks_diamond` / `benchmark_sif4_sin3n4_cvd`
 - `artifacts/traces/sif4_benchmark_large_trace.h5`
 - `artifacts/traces/ac_benchmark_large_trace.h5`
 
-## 3. 手法ごとの制約
-| 手法 | 制約（主） |
-|---|---|
-| `baseline` | element-overlap hard ban, phase/site hard mask, physical gate, Hard Band(dynamic), floors |
-| `learnckpp` | overall候補再合成 + sparse選択 + coverage postselect + projection + Hard Band |
-| `pooling` | graph-based assignment + hard mask + cluster guard + learnckpp bridge |
-
-共通必須:
-- `hard_ban_violations=0`
-- 保存則違反/負濃度 gate
-- `pass_rate >= 0.75` かつ `mean_rel_diff <= 0.40`
-
-## 4. QoL適用内容（Qol_new準拠）
+## 3. QoL適用内容（Qol_new準拠）
 - Physics-first（元素保存・サイト整合・非負）
 - Hard Band + dynamic bounded
 - Gate-First + Compress
 - split: `adaptive_kfold`
 - QoI: `species_last/species_max` + `species_integral/deposition_integral`
+
+## 4. 手法ごとの制約（現行実装）
+### 4.1 全手法共通の必須制約
+- `hard_ban_violations=0`（共通元素ゼロのマージ禁止を厳守）
+- 物理 gate:
+  - 元素保存違反が閾値以下
+  - 負濃度ステップ数が閾値以下（実運用では0）
+- QoI gate:
+  - `pass_rate >= 0.75`
+  - `mean_rel_diff <= 0.40`
+- split:
+  - `adaptive_kfold` を既定
+  - `n_cases<4` のみ `in_sample` へフォールバック
+
+### 4.2 手法別の制約詳細
+| 手法 | 構造制約（Hard） | 学習/選択制約（Soft） | 評価時の注意点 |
+|---|---|---|---|
+| `baseline` | element-overlap hard ban、phase/site hard mask、physics floors | stage A/B/C の `target_ratio`, `prune_keep_ratio`, `penalty_scale`, dynamic Hard Band | 反応は元機構反応を直接 keep/drop するため、gas/surface の反応削減内訳が直接読める |
+| `learnckpp` | `S` 由来のクラスタ空間で保存則射影、fallback to baseline | `overall_candidates` 生成、`target_keep_ratio`, `min_keep_count`, coverage-aware postselect | `overall` 再合成反応を使うため、反応の gas/surface 1対1分解は未定義になりやすい（`reaction_domain_split_available=false`） |
+| `pooling` | graph assignment + hard mask（element/phase/site）、cluster guard | `min_clusters`, `coverage_target`, `max_cluster_size_ratio`, train backend（pyg/numpy） | 計算コスト・収束性が backend 依存。large + full-case で停滞リスクがある |
+
+### 4.3 benchmark別に効いている制約
+| benchmark | 支配的な制約 | 実務上の意味 |
+|---|---|---|
+| diamond_large | `min_species_abs=40`, `min_reactions_abs=100`, `max_reaction_species_ratio` | 過圧縮を抑制し、反応ネットワークの可読性を維持 |
+| sif4_large | kfold汎化 + 積分QoI + Hard Band | 反応数が少ない表面反応でも、積分KPIで見て誤差が拡大しやすい |
+| ac_large | kfold汎化（fold間分散） + dynamic Hard Band | 条件差が大きく、特定foldで誤差が急増しやすい |
+
+### 4.4 フォールバック/失敗時ポリシー
+- `learnckpp` 失敗時: baseline経路へフォールバック可能（設定依存）
+- `pooling` 失敗時: rule-based mergeへのフォールバック、または backend 切替（`pyg -> numpy`）
+- split失敗時: `kfold -> in_sample` に自動切替し、`summary.surrogate_split.fallback_reason` に理由記録
+- 採択不能時: gate未通過の中でも `pass_first_pareto` で最も制約順守側を選択し、失敗理由を `gate_evidence` に残す
 
 ## 5. diamond置換内容（今回の要求反映）
 `configs/reduce_diamond_benchmarks_large_*.yaml` を更新:
@@ -101,12 +122,43 @@ large系3ベンチマーク（`benchmarks_diamond` / `benchmark_sif4_sin3n4_cvd`
 - これらは overall再合成反応を使うため、反応の gas/surface 1対1分解は `summary` 上で未定義（`reaction_domain_split_available=false`）。
 - ただし状態クラスタは gas/surface に分けて追跡可能。
 
-## 8. 総合考察
-1. diamondは要求どおり「40+種/100+反応」へ置換できた（floor適用により stage=B採択）。
-2. 3ベンチとも物理制約（hard-ban/保存則/非負）は維持できている。
-3. 不合格の主因は物理破綻ではなく、`adaptive_kfold + integral QoI` 下での誤差（pass_rate不足）。
-4. ac/diamondはfold間の誤差分散が大きく、特定foldで大きく崩れる。
-5. sif4 pooling full-caseは実行停滞が残課題（計算経路の安定化が必要）。
+## 8. 総合考察（詳細）
+### 8.1 まず成立している点
+1. 3ベンチすべてで、物理制約のコアは維持できている。具体的には `hard_ban_violations=0`、保存則/非負の gate は通過しており、「物理的に壊れたモデル」は排除できている。
+2. diamond は要求どおり `40+ species / 100+ reactions` の採択条件に置換できた。過圧縮を抑えた状態で比較可能なラインに揃っている。
+3. trace を full-case（sif4:6, ac:8）へ戻したことで、`in_sample` では見えない汎化失敗が検出できる評価系になった。これは短期的には不合格増だが、運用上は正しい方向。
+
+### 8.2 gate 不合格の構造的原因
+1. 主因は物理違反ではなく、`adaptive_kfold + integral QoI` 下の予測誤差拡大である。`pass_rate` が閾値 0.75 に届かず、`mean_rel_diff` も fold により大きく悪化する。
+2. diamond/ac では fold間分散が大きく、ある fold だけ誤差が突出して全体不合格を作る。平均値では見えにくい「最悪fold主導」の失敗モードが明確。
+3. sif4 は平均誤差は比較的小さいが、積分QoIを含めると閾値近傍の QoI が落ちやすく、`pass_rate` を押し下げる。つまり「少数の難QoI」が全体合否を支配している。
+
+### 8.3 手法別の考察
+1. `baseline`:
+  - 反応の gas/surface 内訳を直接追跡でき、診断性が最も高い。
+  - ただし圧縮を進めると特定foldで誤差急増しやすく、kfold下で安定しにくい。
+2. `learnckpp`:
+  - 反応数圧縮は強いが、overall再合成反応のためドメイン別反応内訳の可視性が下がる。
+  - 物理整合は維持しても、fold外推で QoI誤差が増えると gate を越えにくい。
+3. `pooling`:
+  - 状態圧縮は最も強く、species削減効果が大きい。
+  - 一方で large/full-case 条件で計算停滞が出やすく、評価完走性がボトルネック。現状は「精度以前に実行安定性」の改善が必要な局面。
+
+### 8.4 benchmark別の考察
+1. diamond_large:
+  - 40+/100+ 制約で「意味の薄い極端圧縮」は抑止できた。
+  - ただし QoI誤差が依然大きく、構造妥当性だけでは gate 合格に至らない。
+2. sif4_large:
+  - baseline/learnckpp は full-case(k=3) で再評価できたが不合格。
+  - pooling の full-case は停滞し、運用判断に必要な比較が未完。現時点では「評価系の完走性」が最優先課題。
+3. ac_large:
+  - fold依存の外れが強く、平均より worst fold が支配。
+  - pooling は強圧縮できるが、現状は精度面で基準未達。
+
+### 8.5 制約設計の妥当性評価
+1. 今回の制約は「過圧縮を防ぎつつ物理整合を守る」点では機能している。
+2. 一方で、制約を守っても QoI汎化が追従していないため、次段階は「制約緩和」ではなく「誤差源の分解と学習/選択の再重み付け」が中心になる。
+3. 特に積分QoIは運用KPIに近い反面、評価難易度を上げる。したがって QoIごとの重要度とfold寄与を分解し、重みと gate 判定の設計を再調整する必要がある。
 
 ## 9. 次改善アクション
 1. `sif4 pooling(full-case)` の停滞解消（backend切替・stage分割実行・タイムアウト制御）。
