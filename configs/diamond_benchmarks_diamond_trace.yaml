@@ -1,0 +1,17 @@
+run_id: diamond_benchmarks_diamond_trace
+
+simulation:
+  mode: surface_batch
+  surface:
+    mechanism: diamond.yaml
+    interface_phase: diamond_100
+    gas_phase: gas
+    pressure_unit: atm
+
+conditions_csv: ../cantera_model/benchmarks_diamond/benchmarks/diamond_cvd/conditions.csv
+
+integration:
+  n_steps: 120
+
+trace_output:
+  root: ../artifacts/traces

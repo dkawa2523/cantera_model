@@ -1,0 +1,17 @@
+run_id: gri30_tiny_trace
+
+baseline:
+  mechanism: ../assets/mechanisms/gri30.yaml
+  phase: gri30
+
+conditions_csv: ../assets/conditions/gri30_tiny.csv
+
+mixture:
+  fuel: CH4:1.0
+  oxidizer: O2:1.0, N2:3.76
+
+integration:
+  n_steps: 120
+
+trace_output:
+  root: ../artifacts/traces

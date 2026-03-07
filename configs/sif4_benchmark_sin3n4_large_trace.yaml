@@ -1,0 +1,19 @@
+run_id: sif4_benchmark_large_trace
+
+simulation:
+  mode: surface_batch
+  surface:
+    mechanism: ../cantera_model/benchmark_sif4_sin3n4_cvd/mechanisms/SiF4_NH3_mec_large__gri30__multisite3.yaml
+    interface_phase: SI3N4
+    gas_phase: gas
+    pressure_unit: torr
+    include_gas_reactions_in_trace: true
+    trace_wdot_policy: stoich_consistent
+
+conditions_csv: ../cantera_model/benchmark_sif4_sin3n4_cvd/benchmarks/sif4_sin3n4_cvd_large/conditions.csv
+
+integration:
+  n_steps: 80
+
+trace_output:
+  root: ../artifacts/traces

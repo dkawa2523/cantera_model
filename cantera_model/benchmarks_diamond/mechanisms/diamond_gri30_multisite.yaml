@@ -1,0 +1,400 @@
+description: |-
+  Benchmark mechanism for reduction / semiconductor-style deposition surrogate.
+  Gas: full GRI-Mech 3.0 (imported from gri30.yaml).
+  Surface: diamond (100) micro-kinetic mechanism replicated across multiple site families
+  to increase surface species / reactions while keeping a deposition-like pathway to solid C(d).
+  NOTE: Intended as a stress-test benchmark for reduction (prune/merge/cluster),
+  not as a validated semiconductor process model.
+
+generator: cantera_netwark-benchmark-builder
+
+units: {length: cm, time: s, quantity: mol, activation-energy: cal/mol}
+
+phases:
+- name: gas
+  thermo: ideal-gas
+  elements: [O, H, C, N, Ar]
+  species:
+  - gri30.yaml/species: all
+  kinetics: gas
+  reactions:
+  - gri30.yaml/reactions: all
+  transport: mixture-averaged
+  state: {T: 1200.0, P: 0.0263 atm}
+
+- name: diamond
+  thermo: fixed-stoichiometry
+  elements: [C]
+  species: [C(d)]
+
+- name: diamond_100_multi
+  thermo: ideal-surface
+  adjacent-phases: [gas, diamond]
+  elements: [H, C]
+  kinetics: surface
+  reactions: all
+  site-density: 3.0e-09 mol/cm^2
+  species:
+  - t_c6HH
+  - t_c6H*
+  - t_c6*H
+  - t_c6**
+  - t_c6HM
+  - t_c6HM*
+  - t_c6*M
+  - t_c6B
+  - s_c6HH
+  - s_c6H*
+  - s_c6*H
+  - s_c6**
+  - s_c6HM
+  - s_c6HM*
+  - s_c6*M
+  - s_c6B
+  - k_c6HH
+  - k_c6H*
+  - k_c6*H
+  - k_c6**
+  - k_c6HM
+  - k_c6HM*
+  - k_c6*M
+  - k_c6B
+  state:
+    T: 1200.0
+    coverages:
+      t_c6HH: 0.30000000
+      t_c6H*: 0.03333333
+      s_c6HH: 0.30000000
+      s_c6H*: 0.03333333
+      k_c6HH: 0.30000000
+      k_c6H*: 0.03333333
+
+species:
+- name: C(d)
+  composition: {C: 1}
+  thermo:
+    model: constant-cp
+    h0: 0.0 cal/mol
+    s0: 0.0 cal/mol/K
+  equation-of-state:
+    model: constant-volume
+    density: 3.52 g/cm^3
+
+- name: t_c6HH
+  composition: {H: 2}
+  thermo:
+    model: constant-cp
+    h0: 11.4 kcal/mol
+    s0: 21.0 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: t_c6H*
+  composition: {H: 1}
+  thermo:
+    model: constant-cp
+    h0: 51.7 kcal/mol
+    s0: 19.5 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: t_c6*H
+  composition: {H: 1}
+  thermo:
+    model: constant-cp
+    h0: 46.1 kcal/mol
+    s0: 19.9 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: t_c6**
+  composition: {C: 0}
+  thermo:
+    model: constant-cp
+    h0: 90.0 kcal/mol
+    s0: 18.4 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: t_c6HM
+  composition: {C: 1, H: 4}
+  thermo:
+    model: constant-cp
+    h0: 26.9 kcal/mol
+    s0: 40.3 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: t_c6HM*
+  composition: {C: 1, H: 3}
+  thermo:
+    model: constant-cp
+    h0: 65.8 kcal/mol
+    s0: 40.1 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: t_c6*M
+  composition: {C: 1, H: 3}
+  thermo:
+    model: constant-cp
+    h0: 53.3 kcal/mol
+    s0: 38.9 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: t_c6B
+  composition: {C: 1, H: 2}
+  thermo:
+    model: constant-cp
+    h0: 40.9 kcal/mol
+    s0: 26.9 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: s_c6HH
+  composition: {H: 2}
+  thermo:
+    model: constant-cp
+    h0: 11.4 kcal/mol
+    s0: 21.0 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: s_c6H*
+  composition: {H: 1}
+  thermo:
+    model: constant-cp
+    h0: 51.7 kcal/mol
+    s0: 19.5 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: s_c6*H
+  composition: {H: 1}
+  thermo:
+    model: constant-cp
+    h0: 46.1 kcal/mol
+    s0: 19.9 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: s_c6**
+  composition: {C: 0}
+  thermo:
+    model: constant-cp
+    h0: 90.0 kcal/mol
+    s0: 18.4 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: s_c6HM
+  composition: {C: 1, H: 4}
+  thermo:
+    model: constant-cp
+    h0: 26.9 kcal/mol
+    s0: 40.3 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: s_c6HM*
+  composition: {C: 1, H: 3}
+  thermo:
+    model: constant-cp
+    h0: 65.8 kcal/mol
+    s0: 40.1 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: s_c6*M
+  composition: {C: 1, H: 3}
+  thermo:
+    model: constant-cp
+    h0: 53.3 kcal/mol
+    s0: 38.9 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: s_c6B
+  composition: {C: 1, H: 2}
+  thermo:
+    model: constant-cp
+    h0: 40.9 kcal/mol
+    s0: 26.9 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: k_c6HH
+  composition: {H: 2}
+  thermo:
+    model: constant-cp
+    h0: 11.4 kcal/mol
+    s0: 21.0 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: k_c6H*
+  composition: {H: 1}
+  thermo:
+    model: constant-cp
+    h0: 51.7 kcal/mol
+    s0: 19.5 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: k_c6*H
+  composition: {H: 1}
+  thermo:
+    model: constant-cp
+    h0: 46.1 kcal/mol
+    s0: 19.9 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: k_c6**
+  composition: {C: 0}
+  thermo:
+    model: constant-cp
+    h0: 90.0 kcal/mol
+    s0: 18.4 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: k_c6HM
+  composition: {C: 1, H: 4}
+  thermo:
+    model: constant-cp
+    h0: 26.9 kcal/mol
+    s0: 40.3 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: k_c6HM*
+  composition: {C: 1, H: 3}
+  thermo:
+    model: constant-cp
+    h0: 65.8 kcal/mol
+    s0: 40.1 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: k_c6*M
+  composition: {C: 1, H: 3}
+  thermo:
+    model: constant-cp
+    h0: 53.3 kcal/mol
+    s0: 38.9 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+- name: k_c6B
+  composition: {C: 1, H: 2}
+  thermo:
+    model: constant-cp
+    h0: 40.9 kcal/mol
+    s0: 26.9 cal/mol/K
+    cp0: 0.0 cal/mol/K
+
+reactions:
+# t-family surface reactions (replicated from Cantera diamond.yaml)
+- equation: t_c6HH + H <=> t_c6H* + H2
+  rate-constant: {A: 1.3e+14, b: 0.0, Ea: 7.3 kcal/mol}
+- equation: t_c6H* + H <=> t_c6HH
+  rate-constant: {A: 1.3e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: t_c6H* + CH3 <=> t_c6HM
+  rate-constant: {A: 1.5e+13, b: 0.0, Ea: 8.4 kcal/mol}
+- equation: t_c6HM + H <=> t_c6*M + H2
+  rate-constant: {A: 3e+12, b: 0.0, Ea: 8.0 kcal/mol}
+- equation: t_c6*M + H <=> t_c6HM
+  rate-constant: {A: 2e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: t_c6HM + H <=> t_c6HM* + H2
+  rate-constant: {A: 8e+13, b: 0.0, Ea: 5.4 kcal/mol}
+- equation: t_c6HM* + H <=> t_c6HM
+  rate-constant: {A: 6.4e+12, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: t_c6HM* <=> t_c6*M
+  rate-constant: {A: 3e+11, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: t_c6HM* + H <=> t_c6H* + CH3
+  rate-constant: {A: 2e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: t_c6HM* + H <=> t_c6B + H2
+  rate-constant: {A: 4.2e+13, b: 0.0, Ea: 2.5 kcal/mol}
+- equation: t_c6*M + H <=> t_c6B + H2
+  rate-constant: {A: 2e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: t_c6HH + H <=> t_c6*H + H2
+  rate-constant: {A: 2.8e+13, b: 0.0, Ea: 3.1 kcal/mol}
+- equation: t_c6*H + H <=> t_c6HH
+  rate-constant: {A: 2.8e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: t_c6H* + H <=> t_c6** + H2
+  rate-constant: {A: 1e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: t_c6** + H <=> t_c6H*
+  rate-constant: {A: 5e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: t_c6*H + H <=> t_c6** + H2
+  rate-constant: {A: 1e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: t_c6** + H <=> t_c6*H
+  rate-constant: {A: 5e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: t_c6** + CH3 <=> t_c6*M
+  rate-constant: {A: 8e+12, b: 0.0, Ea: 0.5 kcal/mol}
+- equation: t_c6H* <=> t_c6*H
+  rate-constant: {A: 1e+11, b: 0.0, Ea: 7.0 kcal/mol}
+- equation: t_c6B => t_c6HH + C(d)
+  rate-constant: {A: 3.68e+15, b: 0.0, Ea: 0.0 kcal/mol}
+
+# s-family surface reactions (replicated from Cantera diamond.yaml)
+- equation: s_c6HH + H <=> s_c6H* + H2
+  rate-constant: {A: 1.3e+14, b: 0.0, Ea: 7.3 kcal/mol}
+- equation: s_c6H* + H <=> s_c6HH
+  rate-constant: {A: 1.3e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: s_c6H* + CH3 <=> s_c6HM
+  rate-constant: {A: 1.5e+13, b: 0.0, Ea: 8.4 kcal/mol}
+- equation: s_c6HM + H <=> s_c6*M + H2
+  rate-constant: {A: 3e+12, b: 0.0, Ea: 8.0 kcal/mol}
+- equation: s_c6*M + H <=> s_c6HM
+  rate-constant: {A: 2e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: s_c6HM + H <=> s_c6HM* + H2
+  rate-constant: {A: 8e+13, b: 0.0, Ea: 5.4 kcal/mol}
+- equation: s_c6HM* + H <=> s_c6HM
+  rate-constant: {A: 6.4e+12, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: s_c6HM* <=> s_c6*M
+  rate-constant: {A: 3e+11, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: s_c6HM* + H <=> s_c6H* + CH3
+  rate-constant: {A: 2e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: s_c6HM* + H <=> s_c6B + H2
+  rate-constant: {A: 4.2e+13, b: 0.0, Ea: 2.5 kcal/mol}
+- equation: s_c6*M + H <=> s_c6B + H2
+  rate-constant: {A: 2e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: s_c6HH + H <=> s_c6*H + H2
+  rate-constant: {A: 2.8e+13, b: 0.0, Ea: 3.1 kcal/mol}
+- equation: s_c6*H + H <=> s_c6HH
+  rate-constant: {A: 2.8e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: s_c6H* + H <=> s_c6** + H2
+  rate-constant: {A: 1e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: s_c6** + H <=> s_c6H*
+  rate-constant: {A: 5e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: s_c6*H + H <=> s_c6** + H2
+  rate-constant: {A: 1e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: s_c6** + H <=> s_c6*H
+  rate-constant: {A: 5e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: s_c6** + CH3 <=> s_c6*M
+  rate-constant: {A: 8e+12, b: 0.0, Ea: 0.5 kcal/mol}
+- equation: s_c6H* <=> s_c6*H
+  rate-constant: {A: 1e+11, b: 0.0, Ea: 7.0 kcal/mol}
+- equation: s_c6B => s_c6HH + C(d)
+  rate-constant: {A: 3.68e+15, b: 0.0, Ea: 0.0 kcal/mol}
+
+# k-family surface reactions (replicated from Cantera diamond.yaml)
+- equation: k_c6HH + H <=> k_c6H* + H2
+  rate-constant: {A: 1.3e+14, b: 0.0, Ea: 7.3 kcal/mol}
+- equation: k_c6H* + H <=> k_c6HH
+  rate-constant: {A: 1.3e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: k_c6H* + CH3 <=> k_c6HM
+  rate-constant: {A: 1.5e+13, b: 0.0, Ea: 8.4 kcal/mol}
+- equation: k_c6HM + H <=> k_c6*M + H2
+  rate-constant: {A: 3e+12, b: 0.0, Ea: 8.0 kcal/mol}
+- equation: k_c6*M + H <=> k_c6HM
+  rate-constant: {A: 2e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: k_c6HM + H <=> k_c6HM* + H2
+  rate-constant: {A: 8e+13, b: 0.0, Ea: 5.4 kcal/mol}
+- equation: k_c6HM* + H <=> k_c6HM
+  rate-constant: {A: 6.4e+12, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: k_c6HM* <=> k_c6*M
+  rate-constant: {A: 3e+11, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: k_c6HM* + H <=> k_c6H* + CH3
+  rate-constant: {A: 2e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: k_c6HM* + H <=> k_c6B + H2
+  rate-constant: {A: 4.2e+13, b: 0.0, Ea: 2.5 kcal/mol}
+- equation: k_c6*M + H <=> k_c6B + H2
+  rate-constant: {A: 2e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: k_c6HH + H <=> k_c6*H + H2
+  rate-constant: {A: 2.8e+13, b: 0.0, Ea: 3.1 kcal/mol}
+- equation: k_c6*H + H <=> k_c6HH
+  rate-constant: {A: 2.8e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: k_c6H* + H <=> k_c6** + H2
+  rate-constant: {A: 1e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: k_c6** + H <=> k_c6H*
+  rate-constant: {A: 5e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: k_c6*H + H <=> k_c6** + H2
+  rate-constant: {A: 1e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: k_c6** + H <=> k_c6*H
+  rate-constant: {A: 5e+13, b: 0.0, Ea: 0.0 kcal/mol}
+- equation: k_c6** + CH3 <=> k_c6*M
+  rate-constant: {A: 8e+12, b: 0.0, Ea: 0.5 kcal/mol}
+- equation: k_c6H* <=> k_c6*H
+  rate-constant: {A: 1e+11, b: 0.0, Ea: 7.0 kcal/mol}
+- equation: k_c6B => k_c6HH + C(d)
+  rate-constant: {A: 3.68e+15, b: 0.0, Ea: 0.0 kcal/mol}
