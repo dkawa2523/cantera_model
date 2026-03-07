@@ -1,0 +1,32 @@
+run_id: ac_benchmark_large_quick
+
+simulation:
+  mode: surface_batch
+  surface:
+    interface_phase: ac_surf
+    gas_phase: gas
+    pressure_unit: torr
+
+baseline:
+  mechanism: ../cantera_model/benchmark_large/mechanisms/ac_hydrocarbon_cvd_large__gri30.yaml
+
+candidate:
+  mechanism: ../cantera_model/benchmark_large/mechanisms/ac_hydrocarbon_cvd_large__gri30.yaml
+
+conditions_csv: ../cantera_model/benchmark_large/benchmarks/ac_hydrocarbon_cvd_large/conditions_quick.csv
+
+integration:
+  n_steps: 60
+
+evaluation:
+  rel_tolerance: 0.25
+  rel_eps: 1.0e-12
+  qoi:
+    selectors:
+      - gas_X:H2:final
+      - gas_X:C2H2:final
+      - surface_theta:X_T(s):final
+      - deposition_rate:C_bulk:mean
+
+output:
+  root: ../runs

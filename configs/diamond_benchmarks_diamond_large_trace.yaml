@@ -1,0 +1,19 @@
+run_id: diamond_benchmarks_diamond_large_trace
+
+simulation:
+  mode: surface_batch
+  surface:
+    mechanism: ../cantera_model/benchmarks_diamond/mechanisms/diamond_gri30_multisite.yaml
+    interface_phase: diamond_100_multi
+    gas_phase: gas
+    pressure_unit: atm
+    include_gas_reactions_in_trace: true
+    trace_wdot_policy: stoich_consistent
+
+conditions_csv: ../cantera_model/benchmarks_diamond/benchmarks/diamond_cvd_large/conditions.csv
+
+integration:
+  n_steps: 80
+
+trace_output:
+  root: ../artifacts/traces

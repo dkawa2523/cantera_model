@@ -1,0 +1,5 @@
+case_id,T_K,P_Torr,composition,t_end_s,n_steps,area
+base,1713,2,"SiF4:0.1427, NH3:0.8573",1.0,300,1.0
+lowT,1600,2,"SiF4:0.1427, NH3:0.8573",1.0,300,1.0
+highSiF4,1713,2,"SiF4:0.25, NH3:0.75",1.0,300,1.0
+highP,1713,10,"SiF4:0.1427, NH3:0.8573",1.0,300,1.0
