@@ -11,6 +11,7 @@ def test_keep_ratio_policy_adapts_by_source_and_feedback() -> None:
         max_mean_rel=0.40,
         prev_mean_rel_diff=0.35,
         prev_stage_physical=None,
+        prev_stage_structure=None,
         adaptive_cfg={
             "enabled": True,
             "min_keep_ratio": 0.10,
@@ -37,6 +38,7 @@ def test_keep_ratio_policy_disable_returns_raw() -> None:
         max_mean_rel=0.40,
         prev_mean_rel_diff=None,
         prev_stage_physical=None,
+        prev_stage_structure=None,
         adaptive_cfg={"enabled": False},
     )
     assert abs(ratio - 0.15) < 1.0e-12
@@ -57,6 +59,7 @@ def test_keep_ratio_policy_physical_feedback_boost() -> None:
             "raw_conservation_violation": 2.0,
             "raw_negative_steps": 20,
         },
+        prev_stage_structure=None,
         adaptive_cfg={
             "enabled": True,
             "min_keep_ratio": 0.10,

@@ -21,6 +21,14 @@ except Exception:  # pragma: no cover
     TGP_AVAILABLE = False
 
 
+def _seed_torch_rng(seed: int) -> None:
+    if torch is None:
+        return
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():  # pragma: no cover - GPU env dependent
+        torch.cuda.manual_seed_all(int(seed))
+
+
 class _NumpyPoolingModel:
     def __init__(self, *, n_clusters: int, seed: int = 0) -> None:
         self.n_clusters = int(max(1, n_clusters))
@@ -76,6 +84,7 @@ def build_pooling_model(input_dim: int, cfg: dict[str, Any] | None) -> Any:
     dropout = float(model_cfg.get("dropout", 0.1))
 
     if backend in {"pyg", "torch_geometric", "tgp"} and torch is not None and nn is not None and GCNConv is not None:
+        _seed_torch_rng(seed)
         _ = TGP_AVAILABLE and backend == "tgp"
         return _TorchGeometricPoolingModel(
             input_dim=input_dim,
@@ -84,6 +93,7 @@ def build_pooling_model(input_dim: int, cfg: dict[str, Any] | None) -> Any:
             dropout=dropout,
         )
     if backend in {"torch", "mlp"} and torch is not None and nn is not None:
+        _seed_torch_rng(seed)
         return _TorchPoolingModel(input_dim=input_dim, hidden_dim=hidden_dim, n_clusters=n_clusters)
     return _NumpyPoolingModel(n_clusters=n_clusters, seed=seed)
 
@@ -176,18 +186,26 @@ def infer_assignment(model: Any, graph: dict[str, Any], features: np.ndarray, cf
     temp = float(train_cfg.get("temperature", 0.7))
 
     if torch is not None and isinstance(model, _TorchPoolingModel):
+        was_training = bool(getattr(model, "training", False))
+        model.eval()
         with torch.no_grad():
             x = torch.tensor(feat, dtype=torch.float32)
             logits = model(x).cpu().numpy()
+        if was_training:
+            model.train()
         return _softmax(logits, temp)
 
     if torch is not None and isinstance(model, _TorchGeometricPoolingModel):
         edge_index, edge_weight = _graph_edges(graph, n_species)
+        was_training = bool(getattr(model, "training", False))
+        model.eval()
         with torch.no_grad():
             x = torch.tensor(feat, dtype=torch.float32)
             ei = torch.tensor(edge_index, dtype=torch.long)
             ew = torch.tensor(edge_weight, dtype=torch.float32) if edge_weight.size else None
             logits = model(x, ei, ew).cpu().numpy()
+        if was_training:
+            model.train()
         return _softmax(logits, temp)
 
     if isinstance(model, _NumpyPoolingModel):

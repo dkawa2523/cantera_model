@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import time as pytime
 from typing import Any
+
+from datetime import datetime, timezone
 
 import numpy as np
 import yaml
 
 from cantera_model.eval.cantera_runner import load_conditions
+from cantera_model.eval.diagnostic_schema import validate_summary_schema
 from cantera_model.eval.surrogate_eval import compare_with_baseline, fit_lightweight_surrogate, run_surrogate_cases
 from cantera_model.io.trace_store import load_case_bundle
 from cantera_model.network.flux import build_flux, reaction_importance
@@ -23,7 +32,7 @@ from cantera_model.reduction.pooling.constraints import build_hard_mask, build_p
 from cantera_model.reduction.pooling.export import save_pooling_artifact
 from cantera_model.reduction.pooling.features import extract_species_features
 from cantera_model.reduction.pooling.graphs import build_bipartite_graph, build_species_graph
-from cantera_model.reduction.pooling.train import train_pooling_assignment
+from cantera_model.reduction.pooling.train import _refine_cluster_balance_swap, train_pooling_assignment
 from cantera_model.reduction.merge_free import DEFAULT_POLICY, fit_merge_mapping
 from cantera_model.reduction.prune_gate import train_prune_gate
 from cantera_model.types import ReductionMapping
@@ -36,6 +45,115 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+def _resolve_evaluation_contract(eval_cfg: dict[str, Any]) -> dict[str, Any]:
+    contract = dict(eval_cfg.get("contract") or {})
+    contract.setdefault("version", "v1")
+    contract.setdefault("enforce", False)
+    contract.setdefault("invariants_profile", "strict_physical_v1")
+    contract.setdefault("evaluation_profile", "tiered_v35")
+    contract.setdefault("run_policy_profile", "adaptive_kfold_strict_v1")
+    contract.setdefault("diagnostic_schema_strict", False)
+    eval_cfg["contract"] = contract
+    return contract
+
+
+def _validate_evaluation_contract(eval_cfg: dict[str, Any], contract: dict[str, Any]) -> None:
+    if not bool(contract.get("enforce", False)):
+        return
+    required = (
+        "version",
+        "invariants_profile",
+        "evaluation_profile",
+        "run_policy_profile",
+        "diagnostic_schema_strict",
+    )
+    missing = [key for key in required if key not in contract]
+    if missing:
+        raise ValueError(
+            "evaluation.contract missing required keys when enforce=true: " + ", ".join(missing)
+        )
+    eval_profile = str(contract.get("evaluation_profile", "")).strip().lower()
+    if eval_profile == "tiered_v35":
+        err = dict(eval_cfg.get("error_aggregation") or {})
+        if str(err.get("mode", "tiered")).strip().lower() != "tiered":
+            raise ValueError("evaluation.contract requires error_aggregation.mode=tiered")
+        if not bool(err.get("require_explicit_thresholds", False)):
+            raise ValueError(
+                "evaluation.contract requires error_aggregation.require_explicit_thresholds=true"
+            )
+    run_profile = str(contract.get("run_policy_profile", "")).strip().lower()
+    if run_profile == "adaptive_kfold_strict_v1":
+        split = dict(eval_cfg.get("surrogate_split") or {})
+        if str(split.get("mode", "")).strip().lower() != "adaptive_kfold":
+            raise ValueError("evaluation.contract requires surrogate_split.mode=adaptive_kfold")
+        if not bool(split.get("enforce_explicit_policy", False)):
+            raise ValueError(
+                "evaluation.contract requires surrogate_split.enforce_explicit_policy=true"
+            )
+
+
+def _load_metric_taxonomy_profile(
+    eval_cfg: dict[str, Any],
+    *,
+    config_parent: Path,
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    taxonomy_cfg = dict(eval_cfg.get("metric_taxonomy") or {})
+    source = str(taxonomy_cfg.get("source", "legacy_builtin")).strip().lower()
+    profile = str(taxonomy_cfg.get("profile", "legacy_builtin")).strip() or "legacy_builtin"
+    if source != "shared_yaml":
+        resolved = {
+            "source": "legacy_builtin",
+            "profile": "legacy_builtin",
+            "family_exact": {},
+            "family_prefix": {},
+            "species_token": {"delimiter": ":", "take": "after_first"},
+            "metric_family_abs_floor": {},
+        }
+        eval_cfg["metric_taxonomy_resolved"] = resolved
+        return resolved
+
+    path_raw = taxonomy_cfg.get("path", "configs/evaluation/metric_taxonomy_profiles.yaml")
+    taxonomy_path = _resolve_path(str(path_raw), base=config_parent)
+    if not taxonomy_path.exists():
+        if bool(contract.get("enforce", False)):
+            raise FileNotFoundError(f"metric taxonomy profile file not found: {taxonomy_path}")
+        resolved = {
+            "source": "legacy_builtin",
+            "profile": "legacy_builtin",
+            "family_exact": {},
+            "family_prefix": {},
+            "species_token": {"delimiter": ":", "take": "after_first"},
+            "metric_family_abs_floor": {},
+        }
+        eval_cfg["metric_taxonomy_resolved"] = resolved
+        return resolved
+    payload = _load_yaml(taxonomy_path)
+    profiles = dict(payload.get("profiles") or {})
+    selected = dict(profiles.get(profile) or {})
+    if not selected:
+        if bool(contract.get("enforce", False)):
+            raise ValueError(f"metric taxonomy profile not found: {profile}")
+        selected = {}
+        profile = "legacy_builtin"
+    resolved = {
+        "source": "shared_yaml",
+        "profile": profile,
+        "family_exact": dict(selected.get("family_exact") or {}),
+        "family_prefix": dict(selected.get("family_prefix") or {}),
+        "species_token": dict(selected.get("species_token") or {"delimiter": ":", "take": "after_first"}),
+        "metric_family_abs_floor": dict(selected.get("metric_family_abs_floor") or {}),
+    }
+    eval_cfg["metric_taxonomy_resolved"] = resolved
+    # Preserve config-facing metadata so downstream summaries can report effective profile.
+    eval_cfg["metric_taxonomy"] = {
+        "source": "shared_yaml",
+        "path": str(path_raw),
+        "profile": profile,
+    }
+    return resolved
+
+
 def _resolve_path(raw: str | Path, *, base: Path) -> Path:
     path = Path(raw)
     if path.is_absolute():
@@ -45,6 +163,125 @@ def _resolve_path(raw: str | Path, *, base: Path) -> Path:
         return cwd_candidate
     return (base / path).resolve()
 
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _hash_config(cfg: dict[str, Any]) -> str:
+    payload = json.dumps(cfg, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _resolve_git_commit_short() -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        ).strip()
+    except Exception:
+        return ""
+    return out
+
+
+class _RuntimeGuard:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        run_dir: Path,
+        heartbeat_sec: float,
+        no_progress_timeout_sec: float,
+        max_wallclock_sec: float,
+    ) -> None:
+        self._run_id = str(run_id)
+        self._run_dir = Path(run_dir)
+        self._lock_path = self._run_dir / ".run.lock"
+        self._heartbeat_sec = float(max(heartbeat_sec, 0.0))
+        self._no_progress_timeout_sec = float(max(no_progress_timeout_sec, 0.0))
+        self._max_wallclock_sec = float(max(max_wallclock_sec, 0.0))
+        self._start_monotonic = pytime.monotonic()
+        self._last_progress_monotonic = self._start_monotonic
+        self._last_heartbeat_monotonic = 0.0
+        self._acquired = False
+        self._pid = int(os.getpid())
+        self._started_at = _utc_now_iso()
+
+    @property
+    def lock_path(self) -> Path:
+        return self._lock_path
+
+    def acquire(self) -> None:
+        self._run_dir.mkdir(parents=True, exist_ok=True)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        try:
+            fd = os.open(str(self._lock_path), flags, 0o644)
+        except FileExistsError:
+            raise RuntimeError(
+                f"run_id lock already exists: {self._lock_path}. "
+                "Another run with the same --run-id may still be active."
+            ) from None
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "run_id": self._run_id,
+                    "pid": self._pid,
+                    "started_at": self._started_at,
+                    "heartbeat_at": self._started_at,
+                    "last_progress_reason": "acquire",
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+        self._acquired = True
+        now = pytime.monotonic()
+        self._last_progress_monotonic = now
+        self._last_heartbeat_monotonic = now
+
+    def release(self) -> None:
+        if not self._acquired:
+            return
+        try:
+            self._lock_path.unlink(missing_ok=True)
+        finally:
+            self._acquired = False
+
+    def _write_heartbeat(self, reason: str) -> None:
+        if not self._acquired:
+            return
+        heartbeat_at = _utc_now_iso()
+        payload = {
+            "run_id": self._run_id,
+            "pid": self._pid,
+            "started_at": self._started_at,
+            "heartbeat_at": heartbeat_at,
+            "last_progress_reason": str(reason),
+        }
+        self._lock_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def mark_progress(self, reason: str) -> None:
+        now = pytime.monotonic()
+        self._last_progress_monotonic = now
+        if self._heartbeat_sec <= 0.0 or (now - self._last_heartbeat_monotonic) >= self._heartbeat_sec:
+            self._write_heartbeat(reason)
+            self._last_heartbeat_monotonic = now
+
+    def check(self, reason: str) -> None:
+        now = pytime.monotonic()
+        if self._max_wallclock_sec > 0.0 and (now - self._start_monotonic) > self._max_wallclock_sec:
+            raise TimeoutError(
+                f"max_wallclock_sec exceeded ({self._max_wallclock_sec:.1f}s): {self._run_id}"
+            )
+        if self._no_progress_timeout_sec > 0.0 and (now - self._last_progress_monotonic) > self._no_progress_timeout_sec:
+            raise TimeoutError(
+                f"no_progress_timeout_sec exceeded ({self._no_progress_timeout_sec:.1f}s): {self._run_id}"
+            )
+        if self._heartbeat_sec > 0.0 and (now - self._last_heartbeat_monotonic) >= self._heartbeat_sec:
+            self._write_heartbeat(reason)
+            self._last_heartbeat_monotonic = now
 
 def _default_species_meta() -> list[dict[str, Any]]:
     return [
@@ -1017,6 +1254,119 @@ def _selection_weights_from_cfg(selection_cfg: dict[str, Any]) -> dict[str, floa
     }
 
 
+def _selection_nonpass_priority(selection_cfg: dict[str, Any]) -> str:
+    raw = str(selection_cfg.get("nonpass_priority", "structure_then_score")).strip().lower()
+    if raw not in {"structure_then_score", "score_only"}:
+        return "structure_then_score"
+    return raw
+
+
+def _structure_deficit_score(row: dict[str, Any]) -> float:
+    score = max(0.0, -float(row.get("balance_margin", 0.0)))
+    if not bool(row.get("floor_passed", True)):
+        score += 1.0
+    if not bool(row.get("cluster_guard_passed", True)):
+        score += 1.0
+    if not bool(row.get("physical_gate_passed", True)):
+        score += 1.0
+    return float(score)
+
+
+def _selection_quality_score_raw_drift(row: dict[str, Any]) -> float:
+    selection_use_raw_drift = bool(row.get("_selection_use_raw_drift", True))
+    if not selection_use_raw_drift:
+        return float(row.get("selection_score", 0.0))
+    raw_drift = float(row.get("metric_drift_raw", row.get("metric_drift_effective", 1.0)))
+    cap = float(row.get("_selection_raw_drift_cap", 2.0))
+    if not np.isfinite(raw_drift):
+        raw_drift = cap
+    if not np.isfinite(cap) or cap <= 1.0:
+        cap = 2.0
+    normalized = float(np.clip((raw_drift - 1.0) / max(cap - 1.0, 1.0e-12), 0.0, 1.0))
+    return float(1.0 - normalized)
+
+
+def _effective_metric_drift(raw_metric_drift: float, *, cap: float) -> float:
+    raw = float(raw_metric_drift)
+    cap_eff = float(cap)
+    if not np.isfinite(raw):
+        raw = 1.0
+    if (not np.isfinite(cap_eff)) or cap_eff < 1.0:
+        cap_eff = 1.30
+    return float(np.clip(raw, 1.0, cap_eff))
+
+
+def _trim_keep_by_reaction_species_ratio(
+    keep_reactions: np.ndarray,
+    *,
+    species_after: int,
+    max_reaction_species_ratio: float,
+    min_keep_count: int = 1,
+    importance: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    keep = np.asarray(keep_reactions, dtype=bool).reshape(-1).copy()
+    selected_before = int(np.sum(keep))
+    safe_species_after = max(int(species_after), 0)
+    min_keep = max(int(min_keep_count), 1)
+    if selected_before <= 0 or safe_species_after <= 0:
+        return keep, {
+            "applied": False,
+            "selected_before": selected_before,
+            "selected_after": selected_before,
+            "allowed_reactions": selected_before,
+            "dropped_reactions": 0,
+            "ratio_before": 0.0,
+            "ratio_after": 0.0,
+        }
+
+    max_ratio = float(max_reaction_species_ratio)
+    if (not np.isfinite(max_ratio)) or max_ratio <= 0.0:
+        return keep, {
+            "applied": False,
+            "selected_before": selected_before,
+            "selected_after": selected_before,
+            "allowed_reactions": selected_before,
+            "dropped_reactions": 0,
+            "ratio_before": float(selected_before) / float(safe_species_after),
+            "ratio_after": float(selected_before) / float(safe_species_after),
+        }
+
+    allowed = int(np.floor(max_ratio * float(safe_species_after)))
+    allowed = max(allowed, min_keep)
+    if selected_before <= allowed:
+        ratio_now = float(selected_before) / float(safe_species_after)
+        return keep, {
+            "applied": False,
+            "selected_before": selected_before,
+            "selected_after": selected_before,
+            "allowed_reactions": allowed,
+            "dropped_reactions": 0,
+            "ratio_before": ratio_now,
+            "ratio_after": ratio_now,
+        }
+
+    drop_count = int(selected_before - allowed)
+    selected_idx = np.flatnonzero(keep)
+    if importance is not None and np.asarray(importance).shape == keep.shape:
+        importance_vec = np.nan_to_num(np.asarray(importance, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+        selected_importance = importance_vec[selected_idx]
+    else:
+        selected_importance = np.arange(selected_idx.size, dtype=float)
+    drop_order = np.argsort(selected_importance, kind="stable")
+    drop_idx = selected_idx[drop_order[:drop_count]]
+    keep[drop_idx] = False
+    selected_after = int(np.sum(keep))
+    return keep, {
+        "applied": True,
+        "selected_before": selected_before,
+        "selected_after": selected_after,
+        "allowed_reactions": allowed,
+        "dropped_reactions": int(selected_before - selected_after),
+        "ratio_before": float(selected_before) / float(safe_species_after),
+        "ratio_after": float(selected_after) / float(safe_species_after),
+    }
+
+
 def _tie_breaker_sort_key(row: dict[str, Any], tie_breakers: list[str]) -> tuple[float, ...]:
     out: list[float] = []
     reactions_before = max(int(row.get("reactions_before", 1)), 1)
@@ -1040,6 +1390,7 @@ def _tie_breaker_sort_key(row: dict[str, Any], tie_breakers: list[str]) -> tuple
 def _select_stage_pass_first(stage_rows: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]:
     selection_cfg = dict(cfg.get("selection") or {})
     weights = _selection_weights_from_cfg(selection_cfg)
+    nonpass_priority = _selection_nonpass_priority(selection_cfg)
     tie_breakers = [
         str(x).strip()
         for x in list(selection_cfg.get("tie_breakers") or ["reaction_reduction", "species_reduction", "mean_rel_diff"])
@@ -1049,6 +1400,8 @@ def _select_stage_pass_first(stage_rows: list[dict[str, Any]], cfg: dict[str, An
     for row in stage_rows:
         floors = dict(row.get("_floors") or {})
         row["selection_score"] = _stage_selection_score(row, floors, weights)
+        row["structure_deficit_score"] = _structure_deficit_score(row)
+        row["selection_quality_score_raw_drift"] = _selection_quality_score_raw_drift(row)
 
     passed_non_degraded = [
         r
@@ -1077,19 +1430,55 @@ def _select_stage_pass_first(stage_rows: list[dict[str, Any]], cfg: dict[str, An
     floor_rows = [r for r in stage_rows if bool(r.get("floor_passed", True)) and bool(r.get("balance_gate_passed", True))]
     non_degraded = [r for r in stage_rows if not bool(r.get("physical_degraded", False))]
 
-    candidate_pool = passed_non_degraded or passed or floor_non_degraded or floor_rows or non_degraded or stage_rows
-    pareto = _pareto_rows(candidate_pool)
-    if not pareto:
+    if passed_non_degraded:
+        candidate_pool = passed_non_degraded
+        selection_pool_kind = "passed"
+    elif passed:
+        candidate_pool = passed
+        selection_pool_kind = "passed"
+    elif floor_non_degraded:
+        candidate_pool = floor_non_degraded
+        selection_pool_kind = "floor"
+    elif floor_rows:
+        candidate_pool = floor_rows
+        selection_pool_kind = "floor"
+    elif non_degraded:
+        candidate_pool = non_degraded
+        selection_pool_kind = "non_degraded"
+    else:
+        candidate_pool = stage_rows
+        selection_pool_kind = "all"
+    for row in candidate_pool:
+        row["selection_pool_kind"] = str(selection_pool_kind)
+    if selection_pool_kind != "passed" and nonpass_priority == "structure_then_score":
         pareto = list(candidate_pool)
-    pareto.sort(
-        key=lambda r: (
-            -float(r.get("selection_score", -1.0e9)),
-            *_tie_breaker_sort_key(r, tie_breakers),
-            int(r.get("reactions_after", 1.0e9)),
-            int(r.get("species_after", 1.0e9)),
+    else:
+        pareto = _pareto_rows(candidate_pool)
+        if not pareto:
+            pareto = list(candidate_pool)
+    if selection_pool_kind != "passed" and nonpass_priority == "structure_then_score":
+        pareto.sort(
+            key=lambda r: (
+                float(r.get("structure_deficit_score", _structure_deficit_score(r))),
+                -float(r.get("selection_score", -1.0e9)),
+                -float(r.get("selection_quality_score_raw_drift", _selection_quality_score_raw_drift(r))),
+                *_tie_breaker_sort_key(r, tie_breakers),
+                int(r.get("reactions_after", 1.0e9)),
+                int(r.get("species_after", 1.0e9)),
+            )
         )
-    )
+    else:
+        pareto.sort(
+            key=lambda r: (
+                -float(r.get("selection_score", -1.0e9)),
+                -float(r.get("selection_quality_score_raw_drift", _selection_quality_score_raw_drift(r))),
+                *_tie_breaker_sort_key(r, tie_breakers),
+                int(r.get("reactions_after", 1.0e9)),
+                int(r.get("species_after", 1.0e9)),
+            )
+        )
     selected = pareto[0]
+    selected["selection_pool_kind"] = str(selection_pool_kind)
     return {
         "selected": selected,
         "pareto_candidates": pareto,
@@ -1106,6 +1495,7 @@ def _select_stage_physics_first(stage_rows: list[dict[str, Any]], cfg: dict[str,
     selection_cfg = dict(cfg.get("selection") or {})
     policy = str(selection_cfg.get("policy", "physics_first_pareto"))
     weights = _selection_weights_from_cfg(selection_cfg)
+    nonpass_priority = _selection_nonpass_priority(selection_cfg)
 
     if policy == "pass_first_pareto":
         return _select_stage_pass_first(stage_rows, cfg)
@@ -1113,6 +1503,8 @@ def _select_stage_physics_first(stage_rows: list[dict[str, Any]], cfg: dict[str,
     if policy != "physics_first_pareto":
         selected = _choose_stage(stage_rows)
         selected["selection_score"] = _stage_selection_score(selected, dict(selected.get("_floors") or {}), weights)
+        selected["structure_deficit_score"] = _structure_deficit_score(selected)
+        selected["selection_pool_kind"] = "all"
         return {"selected": selected, "pareto_candidates": [selected], "weights": weights, "policy": policy}
 
     passed_floor_non_degraded = [
@@ -1138,25 +1530,125 @@ def _select_stage_physics_first(stage_rows: list[dict[str, Any]], cfg: dict[str,
     floor_rows = [r for r in stage_rows if bool(r.get("floor_passed", True)) and bool(r.get("balance_gate_passed", True))]
     non_degraded = [r for r in stage_rows if not bool(r.get("physical_degraded", False))]
 
+    if passed_floor_non_degraded:
+        selection_pool_kind = "passed"
+    elif passed_floor:
+        selection_pool_kind = "passed"
+    elif floor_non_degraded:
+        selection_pool_kind = "floor"
+    elif floor_rows:
+        selection_pool_kind = "floor"
+    elif non_degraded:
+        selection_pool_kind = "non_degraded"
+    else:
+        selection_pool_kind = "all"
+
     candidate_pool = passed_floor_non_degraded or passed_floor or floor_non_degraded or floor_rows or non_degraded or stage_rows
-    pareto = _pareto_rows(candidate_pool)
-    if not pareto:
+    if selection_pool_kind != "passed" and nonpass_priority == "structure_then_score":
         pareto = list(candidate_pool)
+    else:
+        pareto = _pareto_rows(candidate_pool)
+        if not pareto:
+            pareto = list(candidate_pool)
 
     for row in stage_rows:
         floors = dict(row.get("_floors") or {})
         row["selection_score"] = _stage_selection_score(row, floors, weights)
-    pareto.sort(
-        key=lambda r: (
-            -float(r.get("selection_score", -1.0e9)),
-            float(r.get("mean_rel_diff", 1.0e9)),
-            int(r.get("reactions_after", 1.0e9)),
-            int(r.get("species_after", 1.0e9)),
+        row["structure_deficit_score"] = _structure_deficit_score(row)
+        row["selection_quality_score_raw_drift"] = _selection_quality_score_raw_drift(row)
+    for row in pareto:
+        row["selection_pool_kind"] = str(selection_pool_kind)
+    if selection_pool_kind != "passed" and nonpass_priority == "structure_then_score":
+        pareto.sort(
+            key=lambda r: (
+                float(r.get("structure_deficit_score", _structure_deficit_score(r))),
+                -float(r.get("selection_score", -1.0e9)),
+                -float(r.get("selection_quality_score_raw_drift", _selection_quality_score_raw_drift(r))),
+                float(r.get("mean_rel_diff", 1.0e9)),
+                int(r.get("reactions_after", 1.0e9)),
+                int(r.get("species_after", 1.0e9)),
+            )
         )
-    )
+    else:
+        pareto.sort(
+            key=lambda r: (
+                -float(r.get("selection_score", -1.0e9)),
+                -float(r.get("selection_quality_score_raw_drift", _selection_quality_score_raw_drift(r))),
+                float(r.get("mean_rel_diff", 1.0e9)),
+                int(r.get("reactions_after", 1.0e9)),
+                int(r.get("species_after", 1.0e9)),
+            )
+        )
     selected = pareto[0]
+    selected["selection_pool_kind"] = str(selection_pool_kind)
 
     return {"selected": selected, "pareto_candidates": pareto, "weights": weights, "policy": policy}
+
+
+def _derive_blockers(selected: dict[str, Any]) -> dict[str, Any]:
+    validity_failed = not bool(selected.get("mandatory_validity_passed", True))
+    error_failed = not bool(selected.get("error_gate_passed", selected.get("gate_passed", False)))
+    structure_reasons: list[str] = []
+    if int(selected.get("hard_ban_violations", 0)) > 0:
+        structure_reasons.append("hard_ban")
+    if not bool(selected.get("physical_gate_passed", True)):
+        structure_reasons.append("physical_gate")
+    if not bool(selected.get("floor_passed", True)):
+        structure_reasons.append("physics_floor")
+    if not bool(selected.get("balance_gate_passed", True)):
+        structure_reasons.append("balance_gate")
+    if not bool(selected.get("cluster_guard_passed", True)):
+        structure_reasons.append("cluster_guard")
+    structure_failed = bool(structure_reasons)
+    blockers: list[str] = []
+    if validity_failed:
+        blockers.append("validity")
+    if error_failed:
+        blockers.append("error")
+    if structure_failed:
+        blockers.append("structure")
+    primary_blocker_layer = blockers[0] if blockers else "none"
+    validity_fail_reason_primary = "mandatory_threshold_not_met" if validity_failed else "none"
+    error_fail_reason_primary = (
+        str(selected.get("error_fail_reason_primary", "none")) if error_failed else "none"
+    )
+    secondary_blockers = blockers[1:]
+    return {
+        "primary_blocker_layer": str(primary_blocker_layer),
+        "secondary_blockers": [str(x) for x in secondary_blockers],
+        "validity_fail_reason_primary": str(validity_fail_reason_primary),
+        "error_fail_reason_primary": str(error_fail_reason_primary),
+        "structure_fail_reasons": [str(x) for x in structure_reasons],
+    }
+
+
+def _validate_tiered_error_aggregation_config(
+    error_aggregation_cfg: dict[str, Any], *, require_explicit: bool = False
+) -> None:
+    mode = str(error_aggregation_cfg.get("mode", "tiered")).strip().lower()
+    if mode != "tiered":
+        raise ValueError(
+            "evaluation.error_aggregation.mode must be 'tiered' (legacy modes are removed)"
+        )
+    explicit = bool(error_aggregation_cfg.get("require_explicit_thresholds", False))
+    if require_explicit and not explicit:
+        raise ValueError(
+            "evaluation.error_aggregation.require_explicit_thresholds must be true"
+        )
+    if not explicit and not require_explicit:
+        return
+    required = (
+        "mandatory_case_pass_min",
+        "optional_metric_pass_min",
+        "max_mean_rel_diff_mandatory",
+        "max_mean_rel_diff_optional",
+    )
+    missing = [key for key in required if key not in error_aggregation_cfg]
+    if missing:
+        raise ValueError(
+            "evaluation.error_aggregation missing required keys for mode=tiered: "
+            + ", ".join(str(x) for x in missing)
+        )
 
 
 def _resolve_kfold_count(n_cases: int, cfg: dict[str, Any]) -> int:
@@ -1181,8 +1673,28 @@ def _resolve_kfold_count(n_cases: int, cfg: dict[str, Any]) -> int:
     return int(max(2, min(selected, max(n_cases, 2))))
 
 
+def _validate_explicit_adaptive_kfold_policy(split_cfg: dict[str, Any]) -> None:
+    if not bool(split_cfg.get("enforce_explicit_policy", False)):
+        return
+    policy_raw = split_cfg.get("kfold_policy")
+    if not isinstance(policy_raw, dict):
+        raise ValueError(
+            "evaluation.surrogate_split.kfold_policy is required when enforce_explicit_policy=true"
+        )
+    required = ("min_cases_for_kfold", "default_k", "k_by_case_count")
+    missing = [key for key in required if key not in policy_raw]
+    if missing:
+        raise ValueError(
+            "evaluation.surrogate_split.kfold_policy missing required keys: "
+            + ", ".join(str(x) for x in missing)
+        )
+    if not isinstance(policy_raw.get("k_by_case_count"), dict):
+        raise ValueError("evaluation.surrogate_split.kfold_policy.k_by_case_count must be a mapping")
+
+
 def _resolve_surrogate_split_adaptive(conditions: list[dict[str, Any]], eval_cfg: dict[str, Any]) -> dict[str, Any]:
     split_cfg = dict(eval_cfg.get("surrogate_split") or {})
+    _validate_explicit_adaptive_kfold_policy(split_cfg)
     policy = dict(split_cfg.get("kfold_policy") or {})
     case_ids = [str(c.get("case_id")) for c in conditions]
     n_cases = len(case_ids)
@@ -1216,6 +1728,7 @@ def _resolve_surrogate_split_adaptive(conditions: list[dict[str, Any]], eval_cfg
 
 def _resolve_surrogate_split(conditions: list[dict[str, Any]], eval_cfg: dict[str, Any]) -> dict[str, Any]:
     split_cfg = dict(eval_cfg.get("surrogate_split") or {})
+    cost_cfg = dict(split_cfg.get("cost_control") or {})
     requested = str(split_cfg.get("mode", "kfold"))
     if requested not in {"kfold", "in_sample", "adaptive_kfold"}:
         raise ValueError("evaluation.surrogate_split.mode must be 'kfold', 'in_sample', or 'adaptive_kfold'")
@@ -1239,6 +1752,9 @@ def _resolve_surrogate_split(conditions: list[dict[str, Any]], eval_cfg: dict[st
     if mode == "kfold":
         k = int(split_cfg.get("kfolds", 2))
         k = max(2, min(k, n_cases))
+        max_effective_folds = int(cost_cfg.get("max_effective_folds", 0))
+        if max_effective_folds > 0:
+            k = max(2, min(k, max_effective_folds))
         effective_kfolds = int(k)
         ordered = sorted(case_ids)
         for fold_idx in range(k):
@@ -1279,13 +1795,19 @@ def _evaluate_surrogate_stage(
 ) -> tuple[list[dict[str, Any]], Any, list[dict[str, Any]]]:
     perturb_scale = abs(metric_drift - 1.0) * surrogate_gain
     mode = str(split_plan.get("mode", "in_sample"))
+    split_cfg = dict(eval_cfg.get("surrogate_split") or {})
+    cost_cfg = dict(split_cfg.get("cost_control") or {})
+    early_stop_on_stable_fail = bool(cost_cfg.get("early_stop_on_stable_fail", False))
+    stable_fail_streak = int(max(1, cost_cfg.get("stable_fail_streak", 2)))
+    stable_fail_pass_rate_max = float(cost_cfg.get("stable_fail_pass_rate_max", 0.50))
+    stable_fail_mean_rel_min = float(cost_cfg.get("stable_fail_mean_rel_min", float(eval_cfg.get("rel_tolerance", 0.40))))
     baseline_by_case = {str(r.get("case_id")): r for r in baseline_rows}
     cond_by_case = {str(c.get("case_id")): c for c in conditions}
 
     if surrogate_model_name != "linear_ridge":
         artifact = {"reference_rows": baseline_rows, "global_scale": metric_drift}
         surrogate_rows = run_surrogate_cases(artifact, conditions, qoi_cfg)
-        _, summary = compare_with_baseline(baseline_rows, surrogate_rows, eval_cfg)
+        _, summary = compare_with_baseline(baseline_rows, surrogate_rows, eval_cfg, qoi_cfg=qoi_cfg)
         return surrogate_rows, summary, []
 
     if mode == "in_sample":
@@ -1304,13 +1826,14 @@ def _evaluate_surrogate_stage(
             "perturb_seed": seed + stage_idx,
         }
         surrogate_rows = run_surrogate_cases(artifact, conditions, qoi_cfg)
-        _, summary = compare_with_baseline(baseline_rows, surrogate_rows, eval_cfg)
+        _, summary = compare_with_baseline(baseline_rows, surrogate_rows, eval_cfg, qoi_cfg=qoi_cfg)
         return surrogate_rows, summary, []
 
     folds = list(split_plan.get("folds") or [])
     predicted: list[dict[str, Any]] = []
     baseline_eval: list[dict[str, Any]] = []
     fold_metrics: list[dict[str, Any]] = []
+    stable_fail_hits = 0
     for fold_idx, test_case_ids in enumerate(folds):
         test_ids = [str(x) for x in test_case_ids]
         test_set = set(test_ids)
@@ -1338,7 +1861,7 @@ def _evaluate_surrogate_stage(
         fold_pred = run_surrogate_cases(artifact, test_conditions, qoi_cfg)
         predicted.extend(fold_pred)
         baseline_eval.extend(test_baseline)
-        _, fold_summary = compare_with_baseline(test_baseline, fold_pred, eval_cfg)
+        _, fold_summary = compare_with_baseline(test_baseline, fold_pred, eval_cfg, qoi_cfg=qoi_cfg)
         fold_metrics.append(
             {
                 "fold_index": int(fold_idx),
@@ -1350,14 +1873,21 @@ def _evaluate_surrogate_stage(
                 "qoi_metrics_count": int(fold_summary.qoi_metrics_count),
             }
         )
+        fold_fail = (
+            float(fold_summary.pass_rate) <= stable_fail_pass_rate_max
+            and float(fold_summary.mean_rel_diff or 0.0) >= stable_fail_mean_rel_min
+        )
+        stable_fail_hits = (stable_fail_hits + 1) if fold_fail else 0
+        if early_stop_on_stable_fail and stable_fail_hits >= stable_fail_streak:
+            break
 
     if not predicted:
         artifact = {"reference_rows": baseline_rows, "global_scale": metric_drift}
         predicted = run_surrogate_cases(artifact, conditions, qoi_cfg)
-        _, summary = compare_with_baseline(baseline_rows, predicted, eval_cfg)
+        _, summary = compare_with_baseline(baseline_rows, predicted, eval_cfg, qoi_cfg=qoi_cfg)
         return predicted, summary, []
 
-    _, summary = compare_with_baseline(baseline_eval, predicted, eval_cfg)
+    _, summary = compare_with_baseline(baseline_eval, predicted, eval_cfg, qoi_cfg=qoi_cfg)
     return predicted, summary, fold_metrics
 
 
@@ -1415,6 +1945,7 @@ def _evaluate_physical_gate(
 
     # Project candidate trajectory onto conservation manifold and nonnegative region
     # before gate judgment to avoid numerical-integration artifacts.
+    projection_start = pytime.perf_counter()
     y = np.asarray(
         project_to_conservation(
             y_raw,
@@ -1425,6 +1956,7 @@ def _evaluate_physical_gate(
         ),
         dtype=float,
     )
+    projection_elapsed = float(pytime.perf_counter() - projection_start)
     conservation = float(conservation_violation(y, A_reduced, reference=y0))
     negative_steps = int(np.sum(np.any(y < -1.0e-12, axis=1)))
     passed = (
@@ -1446,6 +1978,7 @@ def _evaluate_physical_gate(
         "fallback_reason": fallback_reason,
         "trajectory_steps": int(y.shape[0]),
         "clusters": int(S_arr.shape[1]),
+        "timing_projection_s": projection_elapsed,
     }
 
 
@@ -1509,14 +2042,18 @@ def _qoi_from_trace_case(case: Any, qoi_cfg: dict[str, Any]) -> dict[str, float]
     species_max = list(qoi_cfg.get("species_max") or [])
     species_integral = list(qoi_cfg.get("species_integral") or [])
     deposition_integral = list(qoi_cfg.get("deposition_integral") or [])
+    builtin_cfg = dict(qoi_cfg.get("qoi_builtin_metrics") or {})
+    include_temperature_metrics = bool(builtin_cfg.get("include_temperature_metrics", True))
+    include_ignition_delay = bool(builtin_cfg.get("include_ignition_delay", True))
 
     idx = {s: i for i, s in enumerate(case.species_names)}
     time = np.asarray(case.time, dtype=float)
-    out: dict[str, float] = {
-        "ignition_delay": _ignition_delay(time, case.temperature),
-        "T_max": float(np.max(case.temperature)),
-        "T_last": float(case.temperature[-1]),
-    }
+    out: dict[str, float] = {}
+    if include_ignition_delay:
+        out["ignition_delay"] = _ignition_delay(time, case.temperature)
+    if include_temperature_metrics:
+        out["T_max"] = float(np.max(case.temperature))
+        out["T_last"] = float(case.temperature[-1])
     for sp in species_last:
         i = idx.get(sp)
         out[f"X_last:{sp}"] = float(max(0.0, case.X[-1, i])) if i is not None else float("nan")
@@ -1661,6 +2198,48 @@ def _build_learnckpp_features(
     return features
 
 
+def _evaluate_metric_replay_health_trust(
+    *,
+    metric_clip_ratio: float,
+    guardrail_trigger_ratio: float,
+    max_metric_clip_ratio: float,
+    min_guardrail_trigger_ratio: float,
+) -> dict[str, Any]:
+    clip_exceeded = bool(metric_clip_ratio > max_metric_clip_ratio)
+    trigger_reliable = bool(guardrail_trigger_ratio >= min_guardrail_trigger_ratio)
+    trust_invalid = bool(clip_exceeded and trigger_reliable)
+    return {
+        "metric_clip_ratio": float(metric_clip_ratio),
+        "metric_clip_guardrail_trigger_ratio": float(guardrail_trigger_ratio),
+        "max_metric_clip_ratio": float(max_metric_clip_ratio),
+        "min_guardrail_trigger_ratio": float(min_guardrail_trigger_ratio),
+        "clip_exceeded": bool(clip_exceeded),
+        "trigger_reliable": bool(trigger_reliable),
+        "replay_health_trust_invalid": bool(trust_invalid),
+    }
+
+
+def _compute_structure_feedback_multiplier(
+    *,
+    prev_stage_structure: dict[str, Any] | None,
+    cfg: dict[str, Any],
+) -> float:
+    enabled = bool(cfg.get("enabled", False))
+    if not enabled or not prev_stage_structure:
+        return 1.0
+
+    alpha = max(float(cfg.get("alpha_domain", 0.8)), 0.0)
+    beta = max(float(cfg.get("beta_balance", 0.5)), 0.0)
+    cap = max(float(cfg.get("max_multiplier", 1.35)), 1.0)
+
+    domain_deficit = max(float(prev_stage_structure.get("domain_deficit", 0.0) or 0.0), 0.0)
+    balance_margin = float(prev_stage_structure.get("balance_margin", 0.0) or 0.0)
+    balance_deficit = max(-balance_margin, 0.0)
+
+    mult = 1.0 + (alpha * domain_deficit) + (beta * balance_deficit)
+    return float(np.clip(mult, 1.0, cap))
+
+
 def _resolve_learnckpp_target_keep_ratio(
     *,
     base_keep_ratio: float,
@@ -1671,6 +2250,7 @@ def _resolve_learnckpp_target_keep_ratio(
     max_mean_rel: float,
     prev_mean_rel_diff: float | None,
     prev_stage_physical: dict[str, Any] | None,
+    prev_stage_structure: dict[str, Any] | None,
     adaptive_cfg: dict[str, Any],
 ) -> tuple[float, dict[str, Any]]:
     raw = float(base_keep_ratio) * float(prune_keep_ratio)
@@ -1720,7 +2300,9 @@ def _resolve_learnckpp_target_keep_ratio(
             physical_mult = max(physical_mult, float(physical_cfg.get("negative_multiplier", 1.10)))
             physical_reason.append("high_raw_negative")
 
-    adjusted = raw * source_mult * split_mult * stage_mult_val * feedback_mult * physical_mult
+    structure_cfg = dict(adaptive_cfg.get("structure_feedback") or {})
+    structure_mult = _compute_structure_feedback_multiplier(prev_stage_structure=prev_stage_structure, cfg=structure_cfg)
+    adjusted = raw * source_mult * split_mult * stage_mult_val * feedback_mult * physical_mult * structure_mult
     adjusted = float(np.clip(adjusted, min_keep, max_keep))
     return adjusted, {
         "enabled": True,
@@ -1734,6 +2316,8 @@ def _resolve_learnckpp_target_keep_ratio(
         "physical_feedback_enabled": physical_enabled,
         "physical_feedback_multiplier": physical_mult,
         "physical_feedback_reason": physical_reason,
+        "structure_feedback_enabled": bool(structure_cfg.get("enabled", False)),
+        "structure_feedback_multiplier": float(structure_mult),
         "min_keep_ratio": min_keep,
         "max_keep_ratio": max_keep,
     }
@@ -1880,10 +2464,155 @@ def _fit_pooling_mapping(
         "pair_cost": pair_cost,
         "species_meta": species_meta,
     }
-    trained = train_pooling_assignment(graph, features, constraints, cfg)
-    S = np.asarray(trained.get("S"), dtype=float)
-    cluster_meta = list(trained.get("cluster_meta") or [])
-    train_metrics = dict(trained.get("train_metrics") or {})
+    model_cfg = dict(cfg.get("model") or {})
+    raw_backend = str(model_cfg.get("backend", "pyg")).strip().lower() or "pyg"
+    backend_candidates_cfg = model_cfg.get("backend_candidates")
+    backend_candidates: list[str]
+    if isinstance(backend_candidates_cfg, (list, tuple)) and backend_candidates_cfg:
+        backend_candidates = [str(x).strip().lower() for x in backend_candidates_cfg if str(x).strip()]
+    else:
+        backend_candidates = [raw_backend, "numpy"]
+    normalized_backends: list[str] = []
+    seen_backends: set[str] = set()
+    for backend in backend_candidates:
+        if backend in seen_backends:
+            continue
+        seen_backends.add(backend)
+        normalized_backends.append(backend)
+
+    candidate_cfg = dict(cfg.get("candidate_selection") or {})
+    candidate_selection_enabled = bool(candidate_cfg.get("enabled", True))
+    dedupe_by_hash = bool(candidate_cfg.get("dedupe_by_assignment_hash", True))
+    swap_cfg = dict(candidate_cfg.get("fallback_swap_refine") or {})
+    swap_enabled = bool(swap_cfg.get("enabled", True))
+    swap_max_steps = int(swap_cfg.get("max_steps", 32))
+    swap_min_cov_improve = float(swap_cfg.get("min_coverage_improve", 1.0e-6))
+    max_cluster_size_ratio = float(train_cfg.get("max_cluster_size_ratio", 1.0))
+    species_weights = np.linalg.norm(features, axis=1)
+
+    def _candidate_dynamics_recon_error(S_cand: np.ndarray) -> float:
+        s_mat = np.asarray(S_cand, dtype=float)
+        if wdot_arr.size == 0 or s_mat.size == 0:
+            return 0.0
+        try:
+            pinv = np.linalg.pinv(s_mat)
+        except np.linalg.LinAlgError:
+            return float("inf")
+        wdot_reduced = np.asarray(wdot_arr @ s_mat, dtype=float)
+        wdot_recon = np.asarray(wdot_reduced @ pinv, dtype=float)
+        denom = np.maximum(np.abs(wdot_arr), 1.0e-9)
+        rel = np.abs(wdot_recon - wdot_arr) / denom
+        return float(np.mean(rel))
+
+    trained_candidates: list[dict[str, Any]] = []
+    for backend in normalized_backends:
+        cfg_backend = dict(cfg)
+        model_cfg_backend = dict(model_cfg)
+        model_cfg_backend["backend"] = backend
+        model_cfg_backend["n_clusters"] = int(max(1, round(features.shape[0] * float(target_ratio))))
+        cfg_backend["model"] = model_cfg_backend
+        trained = train_pooling_assignment(graph, features, constraints, cfg_backend)
+        S = np.asarray(trained.get("S"), dtype=float)
+        assign_hash = hashlib.sha256((S > 0.5).astype(np.uint8).tobytes()).hexdigest()
+        tm = dict(trained.get("train_metrics") or {})
+        trained_candidates.append(
+            {
+                "backend": backend,
+                "source": "backend",
+                "trained": trained,
+                "S": S,
+                "assignment_hash": assign_hash,
+                "coverage_proxy": float(tm.get("coverage_proxy", 0.0)),
+                "max_cluster_size_ratio": float(tm.get("max_cluster_size_ratio", 1.0)),
+                "constraint_loss": float(tm.get("constraint_loss", 0.0)),
+                "hard_ban_violations": int(tm.get("hard_ban_violations", 0)),
+                "cluster_guard_passed": bool(tm.get("cluster_guard_passed", True)),
+                "dynamics_recon_error": _candidate_dynamics_recon_error(S),
+            }
+        )
+
+    unique_candidates: list[dict[str, Any]] = []
+    seen_hashes: set[str] = set()
+    for cand in trained_candidates:
+        if dedupe_by_hash and cand["assignment_hash"] in seen_hashes:
+            continue
+        seen_hashes.add(cand["assignment_hash"])
+        unique_candidates.append(cand)
+    if not unique_candidates:
+        unique_candidates = list(trained_candidates)
+
+    if candidate_selection_enabled and len(unique_candidates) == 1 and swap_enabled:
+        base = unique_candidates[0]
+        swap_result = _refine_cluster_balance_swap(
+            S=np.asarray(base.get("S"), dtype=float),
+            hard_mask=hard_mask,
+            pair_cost=pair_cost,
+            species_weights=species_weights,
+            max_cluster_size_ratio=max_cluster_size_ratio,
+            max_steps=swap_max_steps,
+            min_coverage_improve=swap_min_cov_improve,
+        )
+        if bool(swap_result.get("improved", False)):
+            s_swap = np.asarray(swap_result.get("S"), dtype=float)
+            assignment_hash = hashlib.sha256((s_swap > 0.5).astype(np.uint8).tobytes()).hexdigest()
+            if assignment_hash != base.get("assignment_hash"):
+                trained_base = dict(base.get("trained") or {})
+                train_metrics = dict((trained_base.get("train_metrics") or {}))
+                train_metrics["coverage_proxy"] = float(swap_result.get("coverage_proxy_after", train_metrics.get("coverage_proxy", 0.0)))
+                train_metrics["max_cluster_size_ratio"] = float(
+                    swap_result.get("max_cluster_size_ratio_after", train_metrics.get("max_cluster_size_ratio", 1.0))
+                )
+                train_metrics["cluster_guard_passed"] = bool(
+                    train_metrics.get("max_cluster_size_ratio", 1.0) <= train_metrics.get("max_cluster_size_ratio_limit", 1.0) + 1.0e-12
+                )
+                train_metrics["constraint_loss"] = float(
+                    swap_result.get("constraint_loss_after", train_metrics.get("constraint_loss", 0.0))
+                )
+                trained_base["S"] = s_swap
+                trained_base["S_prob"] = np.asarray(s_swap, dtype=float)
+                trained_base["train_metrics"] = train_metrics
+                unique_candidates.append(
+                    {
+                        "backend": str(base.get("backend", raw_backend)),
+                        "source": "swap_refine",
+                        "trained": trained_base,
+                        "S": s_swap,
+                        "assignment_hash": assignment_hash,
+                        "coverage_proxy": float(train_metrics.get("coverage_proxy", 0.0)),
+                        "max_cluster_size_ratio": float(train_metrics.get("max_cluster_size_ratio", 1.0)),
+                        "constraint_loss": float(train_metrics.get("constraint_loss", 0.0)),
+                        "hard_ban_violations": int(train_metrics.get("hard_ban_violations", 0)),
+                        "cluster_guard_passed": bool(train_metrics.get("cluster_guard_passed", True)),
+                        "dynamics_recon_error": _candidate_dynamics_recon_error(s_swap),
+                    }
+                )
+
+    def _candidate_score(cand: dict[str, Any]) -> tuple[float, float, float, float, float, float, float]:
+        backend_name = str(cand.get("backend", ""))
+        backend_pref = 1.0 if backend_name in {"pyg", "torch_geometric", "tgp"} else 0.0
+        return (
+            1.0 if int(cand.get("hard_ban_violations", 1)) == 0 else 0.0,
+            1.0 if bool(cand.get("cluster_guard_passed", False)) else 0.0,
+            -float(cand.get("dynamics_recon_error", float("inf"))),
+            float(cand.get("coverage_proxy", 0.0)),
+            -float(cand.get("max_cluster_size_ratio", 1.0e9)),
+            -float(cand.get("constraint_loss", 1.0e9)),
+            backend_pref,
+        )
+
+    base_candidate = unique_candidates[0]
+    selected_candidate = max(unique_candidates, key=_candidate_score)
+    if float(selected_candidate.get("dynamics_recon_error", float("inf"))) > float(
+        base_candidate.get("dynamics_recon_error", float("inf"))
+    ) + 1.0e-12:
+        selected_candidate = base_candidate
+    if float(selected_candidate.get("coverage_proxy", 0.0)) + 1.0e-12 < float(base_candidate.get("coverage_proxy", 0.0)):
+        selected_candidate = base_candidate
+
+    trained_selected = dict(selected_candidate.get("trained") or {})
+    S = np.asarray(trained_selected.get("S"), dtype=float)
+    cluster_meta = list(trained_selected.get("cluster_meta") or [])
+    train_metrics = dict(trained_selected.get("train_metrics") or {})
     hard_viol = int(train_metrics.get("hard_ban_violations", 0))
 
     mapping = ReductionMapping(
@@ -1894,10 +2623,25 @@ def _fit_pooling_mapping(
             "target_ratio": float(target_ratio),
             "achieved_ratio": float(S.shape[1]) / float(max(S.shape[0], 1)),
             "hard_ban_violations": int(hard_viol),
-            "pooling_model": str((trained.get("model_info") or {}).get("model_type", "unknown")),
-            "pooling_graph": str((trained.get("model_info") or {}).get("graph_type", graph_kind)),
+            "pooling_model": str((trained_selected.get("model_info") or {}).get("model_type", "unknown")),
+            "pooling_graph": str((trained_selected.get("model_info") or {}).get("graph_type", graph_kind)),
         },
     )
+
+    candidate_scores = [
+        {
+            "backend": str(cand.get("backend", "")),
+            "source": str(cand.get("source", "backend")),
+            "assignment_hash": str(cand.get("assignment_hash", "")),
+            "coverage_proxy": float(cand.get("coverage_proxy", 0.0)),
+            "max_cluster_size_ratio": float(cand.get("max_cluster_size_ratio", 0.0)),
+            "constraint_loss": float(cand.get("constraint_loss", 0.0)),
+            "hard_ban_violations": int(cand.get("hard_ban_violations", 0)),
+            "cluster_guard_passed": bool(cand.get("cluster_guard_passed", True)),
+            "dynamics_recon_error": float(cand.get("dynamics_recon_error", 0.0)),
+        }
+        for cand in unique_candidates
+    ]
 
     saved_path: Path | None = None
     if artifact_path is not None:
@@ -1905,18 +2649,30 @@ def _fit_pooling_mapping(
             artifact_path,
             {
                 "S": S,
-                "S_prob": np.asarray(trained.get("S_prob"), dtype=float),
+                "S_prob": np.asarray(trained_selected.get("S_prob"), dtype=float),
                 "cluster_meta": cluster_meta,
                 "train_metrics": train_metrics,
-                "model_info": dict(trained.get("model_info") or {}),
+                "model_info": dict(trained_selected.get("model_info") or {}),
             },
         )
 
     return mapping, {
         "train_metrics": train_metrics,
-        "model_info": dict(trained.get("model_info") or {}),
+        "model_info": dict(trained_selected.get("model_info") or {}),
         "graph_kind": graph_kind,
         "hard_ban_violations": int(hard_viol),
+        "candidate_count": int(len(trained_candidates)),
+        "candidate_unique_count": int(len(unique_candidates)),
+        "candidate_selected_backend": str(selected_candidate.get("backend", raw_backend)),
+        "candidate_selected_source": str(selected_candidate.get("source", "backend")),
+        "candidate_selected_coverage_proxy": float(selected_candidate.get("coverage_proxy", 0.0)),
+        "candidate_selected_dynamics_recon_error": float(
+            selected_candidate.get("dynamics_recon_error", 0.0)
+        ),
+        "candidate_selected_max_cluster_size_ratio": float(
+            selected_candidate.get("max_cluster_size_ratio", train_metrics.get("max_cluster_size_ratio", 0.0))
+        ),
+        "candidate_scores": candidate_scores,
     }, saved_path
 
 
@@ -2385,11 +3141,87 @@ def main() -> None:
     cfg = _load_yaml(config_path)
 
     qoi_cfg = dict(cfg.get("qoi") or {"species_last": ["CO2", "CO", "CH4", "O2"], "species_max": ["OH", "HO2"]})
+    eval_cfg = dict(cfg.get("evaluation") or {"rel_tolerance": 0.4, "rel_eps": 1.0e-12})
+    contract_cfg = _resolve_evaluation_contract(eval_cfg)
+    non_regression_cfg = dict(eval_cfg.get("non_regression") or {})
+    non_regression_cfg.setdefault("reaction_reduction_priority", True)
+    non_regression_cfg.setdefault("max_reaction_reduction_drop_ratio", 0.02)
+    eval_cfg["non_regression"] = non_regression_cfg
+    validity_cfg = dict(eval_cfg.get("gate_metric_validity") or {})
+    validity_cfg.setdefault("mandatory_hard_mode", "min_valid_count")
+    validity_cfg.setdefault("min_valid_mandatory_count_abs", 1)
+    validity_cfg.setdefault("min_valid_mandatory_ratio", 1.0)
+    validity_cfg.setdefault("min_valid_mandatory_cap_by_total", True)
+    validity_cfg.setdefault("mandatory_metric_validity_mode", "case_pass_rate")
+    validity_cfg.setdefault("mandatory_metric_case_pass_min", None)
+    validity_cfg.setdefault("validity_scope", "coverage_only")
+    validity_cfg.setdefault("mandatory_validity_basis", "coverage_evaluable")
+    validity_cfg.setdefault("mandatory_valid_unit_mode", "species_family_quorum")
+    validity_cfg.setdefault("mandatory_species_family_score_mode", "uniform")
+    validity_cfg.setdefault("mandatory_species_family_case_pass_min", 0.67)
+    validity_cfg.setdefault("mandatory_gate_unit_min_evaluable_case_ratio_shadow", 0.25)
+    eval_cfg["gate_metric_validity"] = validity_cfg
+    error_aggregation_cfg = dict(eval_cfg.get("error_aggregation") or {})
+    error_aggregation_cfg.setdefault("mandatory_error_include_validity", False)
+    error_aggregation_cfg.setdefault("mandatory_quality_scope", "valid_only")
+    error_aggregation_cfg.setdefault("mandatory_tail_scope", "quality_scope")
+    error_aggregation_cfg.setdefault("mandatory_tail_guard_mode", "p95")
+    error_aggregation_cfg.setdefault("mandatory_tail_guard_policy", "conditional_hard")
+    error_aggregation_cfg.setdefault("mandatory_tail_activation_ratio_min", 0.10)
+    error_aggregation_cfg.setdefault("mandatory_tail_exceed_ref", "tail_max")
+    error_aggregation_cfg.setdefault("mandatory_tail_rel_diff_max", 1.50)
+    error_aggregation_cfg.setdefault("mandatory_tail_min_samples", 8)
+    eval_cfg["error_aggregation"] = error_aggregation_cfg
+    surrogate_drift_cfg = dict(eval_cfg.get("surrogate_drift") or {})
+    surrogate_drift_cfg.setdefault("selection_use_raw_drift", True)
+    surrogate_drift_cfg.setdefault("raw_drift_cap_for_selection", 2.0)
+    surrogate_drift_cfg.setdefault("keep_effective_drift_cap_for_eval", 1.30)
+    eval_cfg["surrogate_drift"] = surrogate_drift_cfg
+    metric_taxonomy_resolved = _load_metric_taxonomy_profile(
+        eval_cfg,
+        config_parent=config_path.parent,
+        contract=contract_cfg,
+    )
+    _validate_evaluation_contract(eval_cfg, contract_cfg)
+    qoi_builtin_cfg = dict(eval_cfg.get("qoi_builtin_metrics") or {})
+    merged_builtin_cfg = {
+        "include_temperature_metrics": bool(qoi_builtin_cfg.get("include_temperature_metrics", True)),
+        "include_ignition_delay": bool(qoi_builtin_cfg.get("include_ignition_delay", True)),
+    }
+    qoi_cfg["qoi_builtin_metrics"] = merged_builtin_cfg
     qoi_species_integral = [str(x) for x in list(qoi_cfg.get("species_integral") or []) if str(x)]
     qoi_deposition_integral = [str(x) for x in list(qoi_cfg.get("deposition_integral") or []) if str(x)]
     qoi_integral_keys = [f"X_int:{sp}" for sp in qoi_species_integral] + [f"dep_int:{sp}" for sp in qoi_deposition_integral]
     qoi_integral_count = int(len(qoi_integral_keys))
-    eval_cfg = dict(cfg.get("evaluation") or {"rel_tolerance": 0.4, "rel_eps": 1.0e-12})
+    runtime_cfg = dict(cfg.get("runtime_control") or {})
+    runtime_cfg.update(dict(eval_cfg.get("runtime_control") or {}))
+    heartbeat_sec = float(runtime_cfg.get("heartbeat_sec", 10.0))
+    no_progress_timeout_sec = float(runtime_cfg.get("no_progress_timeout_sec", 0.0))
+    max_wallclock_sec = float(runtime_cfg.get("max_wallclock_sec", 0.0))
+    report_root = Path(cfg.get("report_dir", "reports")).resolve()
+    run_dir = report_root / args.run_id
+    runtime_guard = _RuntimeGuard(
+        run_id=args.run_id,
+        run_dir=run_dir,
+        heartbeat_sec=heartbeat_sec,
+        no_progress_timeout_sec=no_progress_timeout_sec,
+        max_wallclock_sec=max_wallclock_sec,
+    )
+    try:
+        runtime_guard.acquire()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
+    atexit.register(runtime_guard.release)
+    runtime_guard.mark_progress("start")
+
+    run_started_at = _utc_now_iso()
+    total_started = pytime.perf_counter()
+    runtime_meta = {
+        "config_hash": _hash_config(cfg),
+        "git_commit": _resolve_git_commit_short(),
+        "pid": int(os.getpid()),
+        "started_at": run_started_at,
+    }
 
     network_ctx = _load_network_context(cfg, config_parent=config_path.parent, qoi_cfg=qoi_cfg)
     trace_ctx = None if network_ctx is not None else _load_trace_context(cfg, config_parent=config_path.parent)
@@ -2489,6 +3321,7 @@ def main() -> None:
             "used_i_reaction_by_phase": False,
             "source": "trace_h5",
         }
+    runtime_guard.mark_progress("input_context_ready")
 
     if np.asarray(i_reaction).shape != (n_reactions,):
         i_reaction = reaction_importance(rop)
@@ -2507,6 +3340,13 @@ def main() -> None:
         raise ValueError("reduction.mode must be 'baseline' or 'learnckpp' or 'pooling'")
     learnckpp_cfg = dict(cfg.get("learnckpp") or {})
     pooling_cfg = dict(cfg.get("pooling") or {})
+    pooling_bridge_cfg = dict(pooling_cfg.get("bridge") or {})
+    pooling_bridge_enabled = bool(pooling_bridge_cfg.get("enable", True))
+    pooling_bridge_mode_cfg = str(pooling_bridge_cfg.get("mode", "full")).strip().lower() or "full"
+    if pooling_bridge_mode_cfg not in {"full", "light"}:
+        pooling_bridge_mode_cfg = "full"
+    if not pooling_bridge_enabled:
+        pooling_bridge_mode_cfg = "light"
     physics_constraints_cfg = dict(cfg.get("physics_constraints") or {})
     if physics_constraints_cfg:
         pooling_constraint_cfg = dict(pooling_cfg.get("constraint_cfg") or {})
@@ -2533,6 +3373,11 @@ def main() -> None:
             l2=surrogate_l2,
             split_cfg={"mode": "in_sample"},
         )
+    learnckpp_features_cache = (
+        _build_learnckpp_features(time=time, case_slices=case_slices, conditions=conditions)
+        if reduction_mode in {"learnckpp", "pooling"}
+        else None
+    )
 
     policy = _merge_policy_from_config(cfg)
     A = _build_element_matrix(species_meta)
@@ -2540,7 +3385,89 @@ def main() -> None:
     gate_cfg = dict(cfg.get("gate") or {})
     min_pass_rate = float(gate_cfg.get("min_pass_rate", 0.75))
     max_mean_rel = float(gate_cfg.get("max_mean_rel_diff", 0.40))
+    max_mean_rel_guard = float(gate_cfg.get("max_mean_rel_diff_unweighted_guard", max_mean_rel))
     max_cons = float(gate_cfg.get("max_conservation_violation", 0.0))
+    error_aggregation_cfg = dict(eval_cfg.get("error_aggregation") or {})
+    error_aggregation_cfg.setdefault("mode", "tiered")
+    error_aggregation_cfg.setdefault("require_explicit_thresholds", False)
+    _validate_tiered_error_aggregation_config(
+        error_aggregation_cfg,
+        require_explicit=bool(contract_cfg.get("enforce", False)),
+    )
+    if not bool(error_aggregation_cfg.get("require_explicit_thresholds", False)):
+        error_aggregation_cfg.setdefault("mandatory_case_pass_min", min_pass_rate)
+        error_aggregation_cfg.setdefault("optional_metric_pass_min", min_pass_rate)
+        error_aggregation_cfg.setdefault("max_mean_rel_diff_mandatory", max_mean_rel)
+        error_aggregation_cfg.setdefault("max_mean_rel_diff_optional", max_mean_rel_guard)
+    error_aggregation_cfg.setdefault("mandatory_case_mode", "ratio_mean")
+    error_aggregation_cfg.setdefault("mandatory_case_unit_weight_mode", "uniform")
+    error_aggregation_cfg.setdefault("mandatory_quality_scope", "valid_only")
+    error_aggregation_cfg.setdefault("mandatory_tail_scope", "quality_scope")
+    error_aggregation_cfg.setdefault("mandatory_mean_aggregation", "raw")
+    error_aggregation_cfg.setdefault("mandatory_family_weights", {})
+    error_aggregation_cfg.setdefault("mandatory_mean_mode", "winsorized")
+    error_aggregation_cfg.setdefault("mandatory_winsor_cap_multiplier", 3.0)
+    error_aggregation_cfg.setdefault("mandatory_outlier_multiplier", 5.0)
+    error_aggregation_cfg.setdefault("mandatory_outlier_ratio_max", 0.20)
+    error_aggregation_cfg.setdefault("mandatory_error_include_validity", False)
+    error_aggregation_cfg.setdefault("mandatory_tail_guard_policy", "conditional_hard")
+    error_aggregation_cfg.setdefault("mandatory_tail_activation_ratio_min", 0.10)
+    error_aggregation_cfg.setdefault("mandatory_tail_exceed_ref", "tail_max")
+    error_aggregation_cfg.setdefault("mandatory_tail_guard_mode", "p95")
+    error_aggregation_cfg.setdefault("mandatory_tail_rel_diff_max", 1.50)
+    error_aggregation_cfg.setdefault("mandatory_tail_min_samples", 8)
+    error_aggregation_cfg.setdefault("optional_weight", 0.35)
+    eval_cfg["error_aggregation"] = error_aggregation_cfg
+    denominator_mode = str((eval_cfg.get("metric_normalization") or {}).get("denominator_mode", "max_abs_or_floor")).strip().lower()
+    if denominator_mode != "max_abs_or_floor":
+        raise ValueError(
+            "evaluation.metric_normalization.denominator_mode must be 'max_abs_or_floor'"
+        )
+    validity_basis = str(validity_cfg.get("mandatory_validity_basis", "coverage_evaluable")).strip().lower()
+    if validity_basis != "coverage_evaluable":
+        raise ValueError(
+            "evaluation.gate_metric_validity.mandatory_validity_basis must be 'coverage_evaluable'"
+        )
+    surrogate_drift_cfg = dict(eval_cfg.get("surrogate_drift") or {})
+    surrogate_drift_selection_use_raw = bool(surrogate_drift_cfg.get("selection_use_raw_drift", True))
+    surrogate_drift_raw_cap_for_selection = float(
+        surrogate_drift_cfg.get("raw_drift_cap_for_selection", 2.0) or 2.0
+    )
+    if (not np.isfinite(surrogate_drift_raw_cap_for_selection)) or surrogate_drift_raw_cap_for_selection <= 1.0:
+        surrogate_drift_raw_cap_for_selection = 2.0
+    surrogate_drift_effective_cap_for_eval = float(
+        surrogate_drift_cfg.get("keep_effective_drift_cap_for_eval", 1.30) or 1.30
+    )
+    if (not np.isfinite(surrogate_drift_effective_cap_for_eval)) or surrogate_drift_effective_cap_for_eval < 1.0:
+        surrogate_drift_effective_cap_for_eval = 1.30
+    compression_opt_cfg = dict(eval_cfg.get("compression_optimizer") or {})
+    compression_optimizer_enabled = bool(compression_opt_cfg.get("enabled", False))
+    compression_optimizer_mode = str(compression_opt_cfg.get("mode", "deterministic_grid") or "deterministic_grid")
+    compression_extra_trials = int(compression_opt_cfg.get("per_stage_extra_trials", 2) or 2)
+    compression_extra_trials = max(0, min(compression_extra_trials, 4))
+    compression_reaction_priority = bool(compression_opt_cfg.get("reaction_priority", True))
+    compression_guard_mandatory_mean_delta = float(
+        compression_opt_cfg.get("max_allowed_mandatory_mean_delta", 1.0e-6) or 1.0e-6
+    )
+    compression_guard_optional_mean_delta = float(
+        compression_opt_cfg.get("max_allowed_optional_mean_delta", 1.0e-6) or 1.0e-6
+    )
+    compression_guard_mandatory_pass_drop = float(
+        compression_opt_cfg.get("max_allowed_mandatory_pass_rate_drop", 0.0) or 0.0
+    )
+    compression_require_gate_passed = bool(compression_opt_cfg.get("require_gate_passed", True))
+    compression_require_structure_passed = bool(compression_opt_cfg.get("require_structure_passed", True))
+    eval_cfg["compression_optimizer"] = {
+        "enabled": bool(compression_optimizer_enabled),
+        "mode": compression_optimizer_mode,
+        "per_stage_extra_trials": int(compression_extra_trials),
+        "reaction_priority": bool(compression_reaction_priority),
+        "max_allowed_mandatory_mean_delta": float(compression_guard_mandatory_mean_delta),
+        "max_allowed_optional_mean_delta": float(compression_guard_optional_mean_delta),
+        "max_allowed_mandatory_pass_rate_drop": float(compression_guard_mandatory_pass_drop),
+        "require_gate_passed": bool(compression_require_gate_passed),
+        "require_structure_passed": bool(compression_require_structure_passed),
+    }
     physical_cfg = dict(eval_cfg.get("physical_gate") or {})
     physical_enabled = bool(physical_cfg.get("enabled", False))
     physical_max_cons = float(physical_cfg.get("max_conservation_violation", max_cons))
@@ -2582,9 +3509,17 @@ def main() -> None:
     learnckpp_adaptive_cfg = dict(learnckpp_cfg.get("adaptive_keep_ratio") or {})
     prev_stage_mean_rel: float | None = None
     prev_stage_physical: dict[str, Any] | None = None
+    prev_stage_structure: dict[str, Any] | None = None
     pooling_stage_artifacts: dict[str, str] = {}
     pooling_stage_metrics: dict[str, dict[str, Any]] = {}
     pooling_artifact_root = Path(str(pooling_cfg.get("artifact_dir", "artifacts/pooling"))) / args.run_id
+    timing_stage_s: dict[str, float] = {}
+    timing_pooling_fit_s: dict[str, float] = {}
+    timing_bridge_s: dict[str, float] = {}
+    timing_surrogate_eval_s: dict[str, float] = {}
+    timing_physical_gate_s: dict[str, float] = {}
+    timing_projection_s: dict[str, float] = {}
+    compression_trial_keep_scales = (0.90, 0.80, 0.70, 0.60)
 
     def _run_baseline_stage(
         *,
@@ -2595,7 +3530,9 @@ def main() -> None:
         prune_threshold: float,
         prune_keep_ratio: float,
         prune_exact: bool,
-    ) -> tuple[np.ndarray, dict[str, Any], list[dict[str, Any]], Any, dict[str, Any], int, int, float, list[dict[str, Any]]]:
+        max_reaction_species_ratio: float,
+        floor_min_reactions: int,
+    ) -> tuple[np.ndarray, dict[str, Any], list[dict[str, Any]], Any, dict[str, Any], int, int, float, list[dict[str, Any]], dict[str, float]]:
         keep_local, prune_local = train_prune_gate(
             nu,
             rop,
@@ -2608,6 +3545,18 @@ def main() -> None:
             seed=seed,
             return_details=True,
         )
+        keep_local, ratio_trim_meta = _trim_keep_by_reaction_species_ratio(
+            np.asarray(keep_local, dtype=bool),
+            species_after=int(np.asarray(mapping.S).shape[1]),
+            max_reaction_species_ratio=float(max_reaction_species_ratio),
+            min_keep_count=int(floor_min_reactions),
+            importance=np.asarray(i_reaction, dtype=float),
+        )
+        prune_local = dict(prune_local)
+        prune_local["balance_ratio_trim"] = ratio_trim_meta
+        if bool(ratio_trim_meta.get("applied", False)):
+            prune_local["status"] = f"{prune_local.get('status', 'ok')}:ratio_trimmed"
+        t_surrogate_start = pytime.perf_counter()
         surrogate_rows_local, eval_summary_local, fold_metrics_local = _evaluate_surrogate_stage(
             surrogate_model_name=surrogate_model_name,
             conditions=conditions,
@@ -2623,6 +3572,8 @@ def main() -> None:
             seed=seed,
             trained_surrogate=trained_surrogate,
         )
+        surrogate_elapsed = float(pytime.perf_counter() - t_surrogate_start)
+        t_physical_start = pytime.perf_counter()
         physical_local = _evaluate_physical_gate(
             enabled=physical_enabled,
             nu=nu,
@@ -2638,6 +3589,7 @@ def main() -> None:
             degraded=state_degraded,
             fallback_reason=state_fallback_reason,
         )
+        physical_elapsed = float(pytime.perf_counter() - t_physical_start)
         overall_candidates_local = int(n_reactions)
         overall_selected_local = int(np.sum(keep_local))
         overall_select_ratio_local = float(overall_selected_local / max(overall_candidates_local, 1))
@@ -2651,10 +3603,18 @@ def main() -> None:
             overall_selected_local,
             overall_select_ratio_local,
             list(fold_metrics_local),
+            {
+                "timing_surrogate_eval_s": surrogate_elapsed,
+                "timing_physical_gate_s": physical_elapsed,
+                "timing_projection_s": float(physical_local.get("timing_projection_s", 0.0)),
+            },
         )
 
     for stage_idx, stage in enumerate(stages):
+        runtime_guard.check(f"stage_{stage_idx}_start")
+        stage_started = pytime.perf_counter()
         name = str(stage.get("name", "unknown"))
+        runtime_guard.mark_progress(f"stage_{name}_entered")
         target_ratio = float(stage.get("target_ratio", 1.0))
         penalty_scale = float(stage.get("penalty_scale", 1.0))
         prune_lambda = float(stage.get("prune_lambda", 1.0e-3))
@@ -2749,7 +3709,13 @@ def main() -> None:
 
         stage_pooling_metrics: dict[str, Any] = {}
         stage_pooling_artifact_path: str | None = None
+        stage_pooling_fit_elapsed_s = 0.0
+        stage_bridge_elapsed_s = 0.0
+        stage_surrogate_elapsed_s = 0.0
+        stage_physical_elapsed_s = 0.0
+        stage_projection_elapsed_s = 0.0
         if reduction_mode == "pooling":
+            t_pooling_fit_start = pytime.perf_counter()
             stage_pooling_cfg = dict(pooling_cfg)
             stage_pooling_train = dict(stage_pooling_cfg.get("train") or {})
             stage_pooling_train["min_clusters"] = int(stage_min_clusters)
@@ -2791,8 +3757,18 @@ def main() -> None:
                     "train_metrics": {},
                     "model_info": {},
                     "graph_kind": str(pooling_cfg.get("graph", "species")),
+                    "candidate_count": 0,
+                    "candidate_unique_count": 0,
+                    "candidate_selected_backend": "",
+                    "candidate_selected_source": "backend",
+                    "candidate_selected_coverage_proxy": 0.0,
+                    "candidate_selected_dynamics_recon_error": 0.0,
+                    "candidate_selected_max_cluster_size_ratio": 0.0,
+                    "candidate_scores": [],
                 }
                 pooling_mapping_fallback_reasons.append({"stage": name, "reason": stage_pooling_metrics["error"]})
+            stage_pooling_fit_elapsed_s = float(pytime.perf_counter() - t_pooling_fit_start)
+            runtime_guard.mark_progress(f"stage_{name}_pooling_fit_done")
         else:
             mapping = fit_merge_mapping(
                 species_meta,
@@ -2811,18 +3787,34 @@ def main() -> None:
         overall_selected = 0
         overall_select_ratio = 0.0
         stage_split_fold_metrics: list[dict[str, Any]] = []
-        stage_metric_drift = metric_drift
+        stage_metric_drift_raw = float(metric_drift)
+        stage_metric_drift = _effective_metric_drift(
+            stage_metric_drift_raw, cap=surrogate_drift_effective_cap_for_eval
+        )
         stage_reduction_mode = reduction_mode
         learnckpp_fallback_reason: str | None = None
         stage_pooling_fallback_reason: str | None = None
         learnckpp_target_keep_ratio = prune_keep_ratio
         learnckpp_keep_ratio_policy: dict[str, Any] = {}
+        structure_feedback_multiplier = 1.0
+        compression_refine_applied = False
+        compression_refine_trials = 0
+        compression_refine_reaction_delta = 0
+        compression_refine_species_delta = 0
+        compression_refine_mode_effective = "none"
+        compression_refine_guard_passed = True
         nu_balance = np.zeros((int(mapping.S.shape[1]), 0), dtype=float)
+        stage_pooling_bridge_mode = pooling_bridge_mode_cfg if reduction_mode == "pooling" else "full"
+        runtime_guard.check(f"stage_{name}_pre_eval")
 
         if reduction_mode in {"learnckpp", "pooling"}:
+            t_bridge_start = pytime.perf_counter()
             try:
                 ydot_target = np.asarray(wdot @ np.asarray(mapping.S, dtype=float), dtype=float)
-                learnckpp_features = _build_learnckpp_features(time=time, case_slices=case_slices, conditions=conditions)
+                if learnckpp_features_cache is None:
+                    learnckpp_features = _build_learnckpp_features(time=time, case_slices=case_slices, conditions=conditions)
+                else:
+                    learnckpp_features = np.asarray(learnckpp_features_cache, dtype=float)
 
                 candidate_policy = {
                     "hard": dict((policy.get("hard") or {})),
@@ -2858,6 +3850,7 @@ def main() -> None:
                     max_mean_rel=max_mean_rel,
                     prev_mean_rel_diff=prev_stage_mean_rel,
                     prev_stage_physical=prev_stage_physical,
+                    prev_stage_structure=prev_stage_structure,
                     adaptive_cfg=learnckpp_adaptive_cfg,
                 )
                 if overall_candidates > 0:
@@ -2882,6 +3875,7 @@ def main() -> None:
                 select_cfg["coverage_aware_swap_steps"] = int(stage_coverage_swap_steps)
                 learnckpp_target_keep_ratio = staged_keep_ratio
                 learnckpp_keep_ratio_policy = dict(keep_policy)
+                structure_feedback_multiplier = float(keep_policy.get("structure_feedback_multiplier", 1.0) or 1.0)
                 select_cfg.setdefault("method", str(select_cfg.get("method", "hard_concrete")))
                 select_cfg.setdefault("lambda_l0", float(select_cfg.get("lambda_l0", prune_lambda)))
                 select_cfg.setdefault("seed", seed + stage_idx)
@@ -2958,32 +3952,42 @@ def main() -> None:
                     nu_sel = np.asarray(nu_overall[:, keep], dtype=float)
                     nu_balance = np.asarray(nu_sel, dtype=float)
                     rates_target_sel = np.asarray(rates_target[:, keep], dtype=float)
-                    rate_cfg = dict(learnckpp_cfg.get("rate") or {})
-                    model_artifact = fit_rate_model(learnckpp_features, rates_target_sel, rate_cfg)
-                    model_artifact["sim_features"] = learnckpp_features.tolist()
-
-                    proj_cfg = dict(learnckpp_cfg.get("projection") or {})
-                    proj_cfg.setdefault("enabled", True)
-                    proj_cfg.setdefault("max_iter", 4)
-                    proj_cfg.setdefault("clip_nonnegative", True)
-                    proj_cfg["A"] = np.asarray(A @ np.asarray(mapping.S, dtype=float), dtype=float)
-                    proj_cfg["reference"] = np.asarray(X[0] @ np.asarray(mapping.S, dtype=float), dtype=float)
-
-                    y_pred, _ = simulate_reduced(
-                        y0=np.asarray(X[0] @ np.asarray(mapping.S, dtype=float), dtype=float),
-                        time=time,
-                        model_artifact=model_artifact,
-                        nu_overall_sel=nu_sel,
-                        proj_cfg=proj_cfg,
-                    )
-                    rates_pred = predict_rates(model_artifact, learnckpp_features)
-                    if rates_pred.shape[1] != nu_sel.shape[1]:
+                    light_pooling_bridge = reduction_mode == "pooling" and stage_pooling_bridge_mode == "light"
+                    if light_pooling_bridge:
+                        y_pred = np.asarray(X @ np.asarray(mapping.S, dtype=float), dtype=float)
                         rates_pred = np.asarray(rates_target_sel, dtype=float)
-                    select_status = str(select_details.get("status"))
+                        if rates_pred.shape[0] != ydot_target.shape[0]:
+                            rates_pred = np.zeros((ydot_target.shape[0], nu_sel.shape[1]), dtype=float)
+                        select_status = f"{str(select_details.get('status'))}:light_bridge"
+                    else:
+                        rate_cfg = dict(learnckpp_cfg.get("rate") or {})
+                        model_artifact = fit_rate_model(learnckpp_features, rates_target_sel, rate_cfg)
+                        model_artifact["sim_features"] = learnckpp_features.tolist()
 
-                    y_ref = np.asarray(X @ np.asarray(mapping.S, dtype=float), dtype=float)
-                    rel = np.abs(y_pred - y_ref) / (np.abs(y_ref) + 1.0e-12)
-                    stage_metric_drift = float(np.clip(1.0 + float(np.mean(rel)), 1.0, 1.30))
+                        proj_cfg = dict(learnckpp_cfg.get("projection") or {})
+                        proj_cfg.setdefault("enabled", True)
+                        proj_cfg.setdefault("max_iter", 4)
+                        proj_cfg.setdefault("clip_nonnegative", True)
+                        proj_cfg["A"] = np.asarray(A @ np.asarray(mapping.S, dtype=float), dtype=float)
+                        proj_cfg["reference"] = np.asarray(X[0] @ np.asarray(mapping.S, dtype=float), dtype=float)
+
+                        y_pred, _ = simulate_reduced(
+                            y0=np.asarray(X[0] @ np.asarray(mapping.S, dtype=float), dtype=float),
+                            time=time,
+                            model_artifact=model_artifact,
+                            nu_overall_sel=nu_sel,
+                            proj_cfg=proj_cfg,
+                        )
+                        rates_pred = predict_rates(model_artifact, learnckpp_features)
+                        if rates_pred.shape[1] != nu_sel.shape[1]:
+                            rates_pred = np.asarray(rates_target_sel, dtype=float)
+                        y_ref = np.asarray(X @ np.asarray(mapping.S, dtype=float), dtype=float)
+                        rel = np.abs(y_pred - y_ref) / (np.abs(y_ref) + 1.0e-12)
+                        stage_metric_drift_raw = float(1.0 + float(np.mean(rel)))
+                        stage_metric_drift = _effective_metric_drift(
+                            stage_metric_drift_raw, cap=surrogate_drift_effective_cap_for_eval
+                        )
+                        select_status = str(select_details.get("status"))
 
                 overall_selected = int(np.sum(keep)) if keep.size else 0
                 overall_select_ratio = float(overall_selected / max(overall_candidates, 1))
@@ -2993,7 +3997,17 @@ def main() -> None:
                     "keep_ratio": overall_select_ratio,
                     "mode": "learnckpp",
                 }
+                post_prune_meta = dict(select_details.get("post_prune_refine") or {})
+                post_prune_enabled = bool(post_prune_meta.get("enabled", False))
+                compression_refine_mode_effective = "postselect_refine" if post_prune_enabled else "none"
+                compression_refine_applied = bool(post_prune_meta.get("applied", False))
+                compression_refine_trials = int(post_prune_meta.get("steps", 0) or 0) if post_prune_enabled else 0
+                compression_refine_reaction_delta = int(post_prune_meta.get("dropped_total", 0) or 0)
+                compression_refine_species_delta = int(0)
+                compression_refine_guard_passed = True
+                prune_details["post_prune_refine"] = post_prune_meta
 
+                t_surrogate_start = pytime.perf_counter()
                 surrogate_rows, eval_summary, stage_split_fold_metrics = _evaluate_surrogate_stage(
                     surrogate_model_name=surrogate_model_name,
                     conditions=conditions,
@@ -3009,8 +4023,10 @@ def main() -> None:
                     seed=seed,
                     trained_surrogate=trained_surrogate,
                 )
+                stage_surrogate_elapsed_s = float(pytime.perf_counter() - t_surrogate_start)
 
                 keep_gate = np.ones((int(nu_sel.shape[1]),), dtype=bool)
+                t_physical_start = pytime.perf_counter()
                 physical_result = _evaluate_physical_gate(
                     enabled=physical_enabled,
                     nu=nu_sel,
@@ -3026,7 +4042,12 @@ def main() -> None:
                     degraded=state_degraded,
                     fallback_reason=state_fallback_reason,
                 )
+                stage_physical_elapsed_s = float(pytime.perf_counter() - t_physical_start)
+                stage_projection_elapsed_s = float(physical_result.get("timing_projection_s", 0.0))
+                stage_bridge_elapsed_s = float(pytime.perf_counter() - t_bridge_start)
+                runtime_guard.mark_progress(f"stage_{name}_bridge_done")
             except Exception as exc:
+                stage_bridge_elapsed_s = float(pytime.perf_counter() - t_bridge_start)
                 if not learnckpp_fallback_enabled:
                     raise
                 stage_reduction_mode = "baseline_fallback"
@@ -3044,6 +4065,7 @@ def main() -> None:
                     overall_selected,
                     overall_select_ratio,
                     stage_split_fold_metrics,
+                    stage_timing_local,
                 ) = _run_baseline_stage(
                     stage_idx=stage_idx,
                     stage_metric_drift=metric_drift,
@@ -3052,12 +4074,18 @@ def main() -> None:
                     prune_threshold=prune_threshold,
                     prune_keep_ratio=prune_keep_ratio,
                     prune_exact=prune_exact,
+                    max_reaction_species_ratio=float(balance_bands.get("max_reaction_species_ratio", 1.0e9)),
+                    floor_min_reactions=int(stage_floor_min_reactions),
                 )
                 fallback_prefix = ("pooling" if reduction_mode == "pooling" else "learnckpp")
                 prune_details["status"] = f"{fallback_prefix}_failed_baseline:{prune_details.get('status')}"
                 learnckpp_target_keep_ratio = prune_keep_ratio
                 learnckpp_keep_ratio_policy = {"enabled": False, "fallback": True}
                 nu_balance = np.asarray(np.asarray(mapping.S, dtype=float).T @ np.asarray(nu[:, keep], dtype=float), dtype=float)
+                stage_surrogate_elapsed_s = float(stage_timing_local.get("timing_surrogate_eval_s", 0.0))
+                stage_physical_elapsed_s = float(stage_timing_local.get("timing_physical_gate_s", 0.0))
+                stage_projection_elapsed_s = float(stage_timing_local.get("timing_projection_s", 0.0))
+                runtime_guard.mark_progress(f"stage_{name}_baseline_fallback_done")
         else:
             (
                 keep,
@@ -3069,6 +4097,7 @@ def main() -> None:
                 overall_selected,
                 overall_select_ratio,
                 stage_split_fold_metrics,
+                stage_timing_local,
             ) = _run_baseline_stage(
                 stage_idx=stage_idx,
                 stage_metric_drift=stage_metric_drift,
@@ -3077,8 +4106,191 @@ def main() -> None:
                 prune_threshold=prune_threshold,
                 prune_keep_ratio=prune_keep_ratio,
                 prune_exact=prune_exact,
+                max_reaction_species_ratio=float(balance_bands.get("max_reaction_species_ratio", 1.0e9)),
+                floor_min_reactions=int(stage_floor_min_reactions),
             )
             nu_balance = np.asarray(np.asarray(mapping.S, dtype=float).T @ np.asarray(nu[:, keep], dtype=float), dtype=float)
+            stage_surrogate_elapsed_s = float(stage_timing_local.get("timing_surrogate_eval_s", 0.0))
+            stage_physical_elapsed_s = float(stage_timing_local.get("timing_physical_gate_s", 0.0))
+            stage_projection_elapsed_s = float(stage_timing_local.get("timing_projection_s", 0.0))
+            runtime_guard.mark_progress(f"stage_{name}_baseline_done")
+
+        if (
+            compression_optimizer_enabled
+            and compression_extra_trials > 0
+            and compression_optimizer_mode == "deterministic_grid"
+            and stage_reduction_mode in {"baseline", "baseline_fallback"}
+        ):
+            keep_base = np.asarray(keep, dtype=bool).reshape(-1)
+            base_reactions_after = int(np.sum(keep_base))
+            trial_scales = compression_trial_keep_scales[:compression_extra_trials]
+            compression_refine_trials = int(len(trial_scales))
+            compression_refine_mode_effective = "baseline_grid"
+
+            base_pass_rate_mandatory = float(
+                getattr(eval_summary, "pass_rate_mandatory_case", eval_summary.pass_rate) or 0.0
+            )
+            base_mean_rel_mandatory = float(
+                getattr(eval_summary, "mean_rel_diff_mandatory", eval_summary.mean_rel_diff or 0.0) or 0.0
+            )
+            base_mean_rel_optional = float(
+                getattr(eval_summary, "mean_rel_diff_optional", eval_summary.mean_rel_diff or 0.0) or 0.0
+            )
+            base_coverage_gate_passed = bool(
+                getattr(eval_summary, "coverage_gate_passed", getattr(eval_summary, "mandatory_validity_passed", True))
+            )
+            base_error_gate_passed = bool(getattr(eval_summary, "error_gate_passed", True))
+            base_gate_passed = bool(base_coverage_gate_passed and base_error_gate_passed)
+            base_quality_guard_passed = bool(
+                base_pass_rate_mandatory >= (base_pass_rate_mandatory - compression_guard_mandatory_pass_drop)
+            )
+            compression_refine_guard_passed = bool(base_quality_guard_passed)
+            if compression_require_gate_passed and not base_gate_passed:
+                compression_refine_guard_passed = False
+
+            if (
+                compression_refine_guard_passed
+                and base_reactions_after > int(stage_floor_min_reactions)
+                and keep_base.shape[0] == int(n_reactions)
+            ):
+                s_arr_refine = np.asarray(mapping.S, dtype=float)
+                x_reduced_refine = np.asarray(X @ s_arr_refine, dtype=float)
+                wdot_reduced_refine = np.asarray(wdot @ s_arr_refine, dtype=float)
+                f_reduced_refine = np.asarray(s_arr_refine.T @ np.asarray(F_bar, dtype=float) @ s_arr_refine, dtype=float)
+                balance_activity_weights = _build_species_activity_weights(
+                    x_reduced_refine,
+                    wdot_reduced_refine,
+                    f_reduced_refine,
+                    cfg,
+                )
+                balance_essential_mask = _build_essential_cluster_mask(s_arr_refine, species_meta, essential_species)
+                floor_min_species_local = int(floors.get("min_species_after", 0))
+                floor_min_reactions_local = int(floors.get("min_reactions_after", 0))
+                best_trial: dict[str, Any] | None = None
+                trial_timing_physical = 0.0
+                trial_timing_projection = 0.0
+
+                keep_indices = [int(i) for i in np.where(keep_base)[0]]
+                sorted_keep_indices = sorted(keep_indices, key=lambda i: (-float(i_reaction[i]), i))
+                for scale in trial_scales:
+                    target_count = int(np.ceil(float(base_reactions_after) * float(scale)))
+                    target_count = max(int(stage_floor_min_reactions), min(target_count, base_reactions_after))
+                    if target_count >= base_reactions_after:
+                        continue
+                    selected_idx = sorted_keep_indices[:target_count]
+                    keep_trial = np.zeros_like(keep_base, dtype=bool)
+                    if selected_idx:
+                        keep_trial[np.asarray(selected_idx, dtype=int)] = True
+                    reactions_after_trial = int(np.sum(keep_trial))
+                    if reactions_after_trial >= base_reactions_after:
+                        continue
+                    if reactions_after_trial < floor_min_reactions_local:
+                        continue
+
+                    t_trial_physical = pytime.perf_counter()
+                    physical_trial = _evaluate_physical_gate(
+                        enabled=physical_enabled,
+                        nu=nu,
+                        rop=rop,
+                        dt=dt,
+                        A=A,
+                        X=X,
+                        S=np.asarray(mapping.S, dtype=float),
+                        keep_reactions=np.asarray(keep_trial, dtype=bool),
+                        max_conservation_violation=physical_max_cons,
+                        max_negative_steps=physical_max_negative_steps,
+                        state_source=state_source,
+                        degraded=state_degraded,
+                        fallback_reason=state_fallback_reason,
+                    )
+                    trial_timing_physical += float(pytime.perf_counter() - t_trial_physical)
+                    trial_timing_projection += float(physical_trial.get("timing_projection_s", 0.0))
+                    physical_trial_passed = bool(physical_trial.get("passed", True))
+
+                    nu_balance_trial = np.asarray(
+                        np.asarray(mapping.S, dtype=float).T @ np.asarray(nu[:, keep_trial], dtype=float),
+                        dtype=float,
+                    )
+                    species_after_trial = int(mapping.S.shape[1])
+                    floor_passed_trial = bool(
+                        species_after_trial >= floor_min_species_local
+                        and reactions_after_trial >= floor_min_reactions_local
+                    )
+                    balance_metrics_trial = _compute_structural_balance_metrics(
+                        nu_reduced=nu_balance_trial,
+                        species_after=species_after_trial,
+                        reactions_after=reactions_after_trial,
+                        activity_weights=balance_activity_weights,
+                        essential_cluster_mask=balance_essential_mask,
+                        S_reduced=np.asarray(mapping.S, dtype=float),
+                        species_before=int(n_species),
+                        top_weight_mass_ratio=float(balance_bands.get("top_weight_mass_ratio", 0.80)),
+                        balance_mode=str(balance_bands.get("balance_mode", "binary")),
+                    )
+                    balance_result_trial = _evaluate_balance_gate(balance_metrics_trial, balance_bands)
+                    balance_passed_trial = bool(balance_result_trial.get("passed", True))
+                    structure_passed_trial = bool(
+                        floor_passed_trial
+                        and balance_passed_trial
+                        and (physical_trial_passed if physical_enabled else True)
+                    )
+                    if compression_require_structure_passed and not structure_passed_trial:
+                        continue
+
+                    trial_pass_rate_mandatory = float(base_pass_rate_mandatory)
+                    trial_mean_rel_mandatory = float(base_mean_rel_mandatory)
+                    trial_mean_rel_optional = float(base_mean_rel_optional)
+                    quality_guard_passed = bool(
+                        (base_pass_rate_mandatory - trial_pass_rate_mandatory)
+                        <= (compression_guard_mandatory_pass_drop + 1.0e-12)
+                    )
+                    quality_guard_passed = bool(
+                        quality_guard_passed
+                        and (trial_mean_rel_mandatory - base_mean_rel_mandatory)
+                        <= (compression_guard_mandatory_mean_delta + 1.0e-12)
+                    )
+                    quality_guard_passed = bool(
+                        quality_guard_passed
+                        and (trial_mean_rel_optional - base_mean_rel_optional)
+                        <= (compression_guard_optional_mean_delta + 1.0e-12)
+                    )
+                    if not quality_guard_passed:
+                        continue
+
+                    candidate_key = (
+                        reactions_after_trial if compression_reaction_priority else species_after_trial,
+                        species_after_trial if compression_reaction_priority else reactions_after_trial,
+                    )
+                    if best_trial is None or candidate_key < best_trial["candidate_key"]:
+                        best_trial = {
+                            "candidate_key": candidate_key,
+                            "keep": keep_trial,
+                            "physical_result": dict(physical_trial),
+                            "nu_balance": nu_balance_trial,
+                            "reactions_after": reactions_after_trial,
+                            "species_after": species_after_trial,
+                        }
+
+                stage_physical_elapsed_s += float(trial_timing_physical)
+                stage_projection_elapsed_s += float(trial_timing_projection)
+                if best_trial is not None:
+                    keep = np.asarray(best_trial["keep"], dtype=bool)
+                    physical_result = dict(best_trial["physical_result"])
+                    nu_balance = np.asarray(best_trial["nu_balance"], dtype=float)
+                    overall_selected = int(best_trial["reactions_after"])
+                    overall_select_ratio = float(overall_selected / max(overall_candidates, 1))
+                    compression_refine_applied = True
+                    compression_refine_reaction_delta = int(base_reactions_after - int(best_trial["reactions_after"]))
+                    compression_refine_species_delta = int(0)
+                    prune_details = dict(prune_details)
+                    prune_details["compression_refine"] = {
+                        "applied": True,
+                        "trials": int(compression_refine_trials),
+                        "reaction_delta": int(compression_refine_reaction_delta),
+                        "species_delta": int(compression_refine_species_delta),
+                        "mode_effective": "baseline_grid",
+                    }
+                    prune_details["status"] = f"{prune_details.get('status', 'ok')}:compression_refined"
 
         cons_violation = float(physical_result["conservation_violation"])
         negative_steps = int(physical_result["negative_steps"])
@@ -3090,8 +4302,8 @@ def main() -> None:
             gas_reactions_after = int(np.sum(keep_arr & gas_reaction_mask))
             surface_reactions_after = int(np.sum(keep_arr & surface_reaction_mask))
         else:
-            gas_reactions_after = -1
-            surface_reactions_after = -1
+            gas_reactions_after = None
+            surface_reactions_after = None
         cluster_domain_counts_after = _cluster_domain_counts(np.asarray(mapping.S, dtype=float), species_meta)
         gas_species_after = int(cluster_domain_counts_after.get("gas", 0))
         surface_species_after = int(cluster_domain_counts_after.get("surface", 0))
@@ -3146,6 +4358,259 @@ def main() -> None:
         balance_margin_detail = dict(margin_vector.get("detail") or {})
         cluster_guard_violations = [v for v in balance_violations if v == "max_cluster_size_ratio"]
         cluster_guard_passed = len(cluster_guard_violations) == 0
+        mandatory_total_metric_count = int(getattr(eval_summary, "mandatory_total_metric_count", 0) or 0)
+        valid_mandatory_metric_count = int(getattr(eval_summary, "valid_mandatory_metric_count", 0) or 0)
+        invalid_mandatory_metric_count = int(getattr(eval_summary, "invalid_mandatory_metric_count", 0) or 0)
+        inactive_mandatory_metric_count = int(getattr(eval_summary, "inactive_mandatory_metric_count", 0) or 0)
+        active_invalid_mandatory_metric_count = int(getattr(eval_summary, "active_invalid_mandatory_metric_count", 0) or 0)
+        mandatory_metric_case_pass_rates = dict(getattr(eval_summary, "mandatory_metric_case_pass_rates", {}) or {})
+        mandatory_metric_valid_case_pass_min_effective = float(
+            getattr(eval_summary, "mandatory_metric_valid_case_pass_min_effective", 0.0) or 0.0
+        )
+        mandatory_metric_validity_mode_effective = str(
+            getattr(eval_summary, "mandatory_metric_validity_mode_effective", "case_pass_rate") or "case_pass_rate"
+        )
+        mandatory_total_gate_unit_count = int(getattr(eval_summary, "mandatory_total_gate_unit_count", 0) or 0)
+        valid_mandatory_gate_unit_count = int(getattr(eval_summary, "valid_mandatory_gate_unit_count", 0) or 0)
+        valid_mandatory_gate_unit_count_case_rate = int(
+            getattr(
+                eval_summary,
+                "valid_mandatory_gate_unit_count_case_rate",
+                valid_mandatory_gate_unit_count,
+            )
+            or 0
+        )
+        valid_mandatory_gate_unit_count_coverage = int(
+            getattr(
+                eval_summary,
+                "valid_mandatory_gate_unit_count_coverage",
+                valid_mandatory_gate_unit_count,
+            )
+            or 0
+        )
+        mandatory_validity_basis_effective = str(
+            getattr(eval_summary, "mandatory_validity_basis_effective", "coverage_evaluable")
+            or "coverage_evaluable"
+        )
+        mandatory_quality_gate_unit_count = int(
+            getattr(eval_summary, "mandatory_quality_gate_unit_count", mandatory_total_gate_unit_count)
+            or mandatory_total_gate_unit_count
+        )
+        mandatory_quality_metric_count = int(
+            getattr(eval_summary, "mandatory_quality_metric_count", mandatory_total_metric_count)
+            or mandatory_total_metric_count
+        )
+        mandatory_gate_unit_case_pass_rates = dict(
+            getattr(eval_summary, "mandatory_gate_unit_case_pass_rates", {}) or {}
+        )
+        mandatory_gate_unit_evaluable_case_rates = dict(
+            getattr(eval_summary, "mandatory_gate_unit_evaluable_case_rates", {}) or {}
+        )
+        mandatory_gate_unit_valid_count_shadow_evaluable_ratio = int(
+            getattr(eval_summary, "mandatory_gate_unit_valid_count_shadow_evaluable_ratio", 0) or 0
+        )
+        mandatory_gate_unit_min_evaluable_case_ratio_shadow_effective = float(
+            getattr(eval_summary, "mandatory_gate_unit_min_evaluable_case_ratio_shadow_effective", 0.25)
+            or 0.25
+        )
+        active_invalid_mandatory_gate_unit_keys = [
+            str(x) for x in list(getattr(eval_summary, "active_invalid_mandatory_gate_unit_keys", []) or [])
+        ]
+        mandatory_gate_unit_mode_effective = str(
+            getattr(eval_summary, "mandatory_gate_unit_mode_effective", "species_family_quorum")
+            or "species_family_quorum"
+        )
+        mandatory_species_family_score_mode_effective = str(
+            getattr(eval_summary, "mandatory_species_family_score_mode_effective", "uniform")
+            or "uniform"
+        )
+        mandatory_quality_scope_effective = str(
+            getattr(eval_summary, "mandatory_quality_scope_effective", "valid_only") or "valid_only"
+        )
+        mandatory_tail_scope_effective = str(
+            getattr(eval_summary, "mandatory_tail_scope_effective", "quality_scope") or "quality_scope"
+        )
+        mandatory_species_family_case_pass_min_effective = float(
+            getattr(eval_summary, "mandatory_species_family_case_pass_min_effective", 0.67) or 0.67
+        )
+        min_valid_mandatory_count_effective = int(getattr(eval_summary, "min_valid_mandatory_count_effective", 0) or 0)
+        mandatory_validity_passed = bool(getattr(eval_summary, "mandatory_validity_passed", True))
+        pass_rate_mandatory_case = float(getattr(eval_summary, "pass_rate_mandatory_case", eval_summary.pass_rate) or 0.0)
+        pass_rate_mandatory_case_all_units = float(
+            getattr(eval_summary, "pass_rate_mandatory_case_all_units", pass_rate_mandatory_case) or 0.0
+        )
+        pass_rate_mandatory_case_all_required = float(
+            getattr(eval_summary, "pass_rate_mandatory_case_all_required", pass_rate_mandatory_case) or 0.0
+        )
+        pass_rate_mandatory_case_ratio_mean = float(
+            getattr(eval_summary, "pass_rate_mandatory_case_ratio_mean", pass_rate_mandatory_case) or 0.0
+        )
+        pass_rate_mandatory_case_all_required_all_units = float(
+            getattr(
+                eval_summary,
+                "pass_rate_mandatory_case_all_required_all_units",
+                pass_rate_mandatory_case_all_required,
+            )
+            or 0.0
+        )
+        pass_rate_mandatory_case_ratio_mean_all_units = float(
+            getattr(
+                eval_summary,
+                "pass_rate_mandatory_case_ratio_mean_all_units",
+                pass_rate_mandatory_case_ratio_mean,
+            )
+            or 0.0
+        )
+        mandatory_case_mode_effective = str(
+            getattr(eval_summary, "mandatory_case_mode_effective", "ratio_mean") or "ratio_mean"
+        )
+        mandatory_case_unit_weight_mode_effective = str(
+            getattr(eval_summary, "mandatory_case_unit_weight_mode_effective", "uniform") or "uniform"
+        )
+        pass_rate_optional_case = float(getattr(eval_summary, "pass_rate_optional_case", eval_summary.pass_rate) or 0.0)
+        pass_rate_optional_metric_mean = float(
+            getattr(eval_summary, "pass_rate_optional_metric_mean", eval_summary.pass_rate) or 0.0
+        )
+        pass_rate_all_metric_legacy = float(
+            getattr(eval_summary, "pass_rate_all_metric_legacy", eval_summary.pass_rate) or 0.0
+        )
+        mean_rel_diff_mandatory = float(
+            getattr(eval_summary, "mean_rel_diff_mandatory", eval_summary.mean_rel_diff or 0.0) or 0.0
+        )
+        mean_rel_diff_mandatory_all_units = float(
+            getattr(eval_summary, "mean_rel_diff_mandatory_all_units", mean_rel_diff_mandatory)
+            or mean_rel_diff_mandatory
+        )
+        mean_rel_diff_mandatory_raw = float(
+            getattr(eval_summary, "mean_rel_diff_mandatory_raw", mean_rel_diff_mandatory) or 0.0
+        )
+        mean_rel_diff_mandatory_family_weighted = float(
+            getattr(eval_summary, "mean_rel_diff_mandatory_family_weighted", mean_rel_diff_mandatory) or 0.0
+        )
+        mean_rel_diff_mandatory_winsorized = float(
+            getattr(eval_summary, "mean_rel_diff_mandatory_winsorized", mean_rel_diff_mandatory) or 0.0
+        )
+        mandatory_rel_outlier_ratio = float(
+            getattr(eval_summary, "mandatory_rel_outlier_ratio", 0.0) or 0.0
+        )
+        mandatory_rel_outlier_ratio_all_units = float(
+            getattr(eval_summary, "mandatory_rel_outlier_ratio_all_units", mandatory_rel_outlier_ratio)
+            or mandatory_rel_outlier_ratio
+        )
+        mandatory_rel_outlier_ratio_max_effective = float(
+            getattr(eval_summary, "mandatory_rel_outlier_ratio_max_effective", 0.20) or 0.20
+        )
+        mandatory_rel_diff_p95 = float(
+            getattr(eval_summary, "mandatory_rel_diff_p95", mean_rel_diff_mandatory_raw) or 0.0
+        )
+        mandatory_rel_diff_p95_all_units = float(
+            getattr(eval_summary, "mandatory_rel_diff_p95_all_units", mandatory_rel_diff_p95)
+            or mandatory_rel_diff_p95
+        )
+        mandatory_tail_guard_passed = bool(getattr(eval_summary, "mandatory_tail_guard_passed", True))
+        mandatory_tail_guard_mode_effective = str(
+            getattr(eval_summary, "mandatory_tail_guard_mode_effective", "p95") or "p95"
+        )
+        mandatory_tail_rel_diff_max_effective = float(
+            getattr(eval_summary, "mandatory_tail_rel_diff_max_effective", 1.50) or 1.50
+        )
+        mandatory_quality_scope_empty = bool(
+            getattr(eval_summary, "mandatory_quality_scope_empty", False)
+        )
+        mandatory_mean_aggregation_effective = str(
+            getattr(eval_summary, "mandatory_mean_aggregation_effective", "raw") or "raw"
+        )
+        mandatory_mean_mode_effective = str(
+            getattr(eval_summary, "mandatory_mean_mode_effective", "winsorized") or "winsorized"
+        )
+        mean_rel_diff_optional = float(
+            getattr(eval_summary, "mean_rel_diff_optional", eval_summary.mean_rel_diff or 0.0) or 0.0
+        )
+        mean_rel_diff_all_metric_legacy = float(
+            getattr(eval_summary, "mean_rel_diff_all_metric_legacy", eval_summary.mean_rel_diff or 0.0) or 0.0
+        )
+        error_gate_score = float(getattr(eval_summary, "error_gate_score", pass_rate_mandatory_case) or 0.0)
+        effective_metric_count = int(
+            getattr(eval_summary, "effective_metric_count", getattr(eval_summary, "qoi_metrics_count", 0)) or 0
+        )
+        suppressed_low_signal_metric_count = int(
+            getattr(eval_summary, "suppressed_low_signal_metric_count", 0) or 0
+        )
+        error_gate_passed = bool(
+            getattr(
+                eval_summary,
+                "error_gate_passed",
+                (eval_summary.pass_rate >= min_pass_rate and (eval_summary.mean_rel_diff or 0.0) <= max_mean_rel),
+            )
+        )
+        coverage_gate_passed = bool(getattr(eval_summary, "coverage_gate_passed", mandatory_validity_passed))
+        mandatory_quality_passed = bool(
+            getattr(eval_summary, "mandatory_quality_passed", getattr(eval_summary, "mandatory_error_passed", True))
+        )
+        optional_quality_passed = bool(
+            getattr(eval_summary, "optional_quality_passed", getattr(eval_summary, "optional_error_passed", True))
+        )
+        mandatory_error_passed = bool(
+            getattr(eval_summary, "mandatory_error_passed", mandatory_quality_passed)
+        )
+        optional_error_passed = bool(
+            getattr(eval_summary, "optional_error_passed", optional_quality_passed)
+        )
+        mandatory_tail_guard_triggered = bool(
+            getattr(eval_summary, "mandatory_tail_guard_triggered", False)
+        )
+        mandatory_tail_guard_hard_applied = bool(
+            getattr(eval_summary, "mandatory_tail_guard_hard_applied", False)
+        )
+        mandatory_tail_guard_policy_effective = str(
+            getattr(eval_summary, "mandatory_tail_guard_policy_effective", "conditional_hard")
+            or "conditional_hard"
+        )
+        mandatory_tail_activation_ratio_min_effective = float(
+            getattr(eval_summary, "mandatory_tail_activation_ratio_min_effective", 0.10) or 0.10
+        )
+        mandatory_tail_exceed_ref_effective = str(
+            getattr(eval_summary, "mandatory_tail_exceed_ref_effective", "tail_max")
+            or "tail_max"
+        )
+        mandatory_tail_exceed_ratio = float(
+            getattr(eval_summary, "mandatory_tail_exceed_ratio", 0.0) or 0.0
+        )
+        mandatory_error_include_validity_effective = bool(
+            getattr(eval_summary, "mandatory_error_include_validity_effective", False)
+        )
+        error_fail_reason_primary = str(
+            getattr(eval_summary, "error_fail_reason_primary", "none") or "none"
+        )
+        evaluation_contract_version = str(
+            getattr(eval_summary, "evaluation_contract_version", contract_cfg.get("version", "v1"))
+            or contract_cfg.get("version", "v1")
+        )
+        metric_taxonomy_profile_effective = str(
+            getattr(
+                eval_summary,
+                "metric_taxonomy_profile_effective",
+                metric_taxonomy_resolved.get("profile", "legacy_builtin"),
+            )
+            or metric_taxonomy_resolved.get("profile", "legacy_builtin")
+        )
+        diagnostic_schema_ok = bool(getattr(eval_summary, "diagnostic_schema_ok", True))
+
+        replay_validity_cfg = dict(eval_cfg.get("gate_metric_validity") or {})
+        replay_trust_detail = _evaluate_metric_replay_health_trust(
+            metric_clip_ratio=float(getattr(eval_summary, "metric_clip_ratio", 0.0) or 0.0),
+            guardrail_trigger_ratio=float(getattr(eval_summary, "metric_clip_guardrail_trigger_ratio", 0.0) or 0.0),
+            max_metric_clip_ratio=float(replay_validity_cfg.get("max_metric_clip_ratio", 1.0)),
+            min_guardrail_trigger_ratio=float(replay_validity_cfg.get("min_guardrail_trigger_ratio", 0.02)),
+        )
+        stage_metric_clip_guardrail_trigger_ratio = float(replay_trust_detail.get("metric_clip_guardrail_trigger_ratio", 0.0))
+        stage_replay_health_trust_invalid = bool(replay_trust_detail.get("replay_health_trust_invalid", False))
+
+        species_deficit = max(float(floor_min_species - species_after), 0.0)
+        reaction_deficit = max(float(floor_min_reactions - reactions_after), 0.0)
+        species_deficit_ratio = species_deficit / float(max(1, floor_min_species))
+        reaction_deficit_ratio = reaction_deficit / float(max(1, floor_min_reactions))
+        domain_deficit = max(species_deficit_ratio, reaction_deficit_ratio)
 
         gate_evidence_by_stage[name] = {
             **physical_result,
@@ -3168,11 +4633,34 @@ def main() -> None:
             "learnckpp_fallback_reason": learnckpp_fallback_reason,
             "learnckpp_target_keep_ratio": float(learnckpp_target_keep_ratio),
             "learnckpp_keep_ratio_policy": learnckpp_keep_ratio_policy,
+            "structure_feedback_multiplier": float(structure_feedback_multiplier),
             "pooling_hard_ban_violations": int(stage_pooling_metrics.get("hard_ban_violations", 0)),
             "pooling_constraint_loss": float((stage_pooling_metrics.get("train_metrics") or {}).get("constraint_loss", 0.0)),
             "pooling_clusters": int((stage_pooling_metrics.get("train_metrics") or {}).get("n_clusters", mapping.S.shape[1])),
             "pooling_graph_kind": str(stage_pooling_metrics.get("graph_kind", "")),
             "pooling_model_type": str((stage_pooling_metrics.get("model_info") or {}).get("model_type", "")),
+            "pooling_candidate_count": int(stage_pooling_metrics.get("candidate_count", 0)),
+            "pooling_candidate_unique_count": int(stage_pooling_metrics.get("candidate_unique_count", 0)),
+            "pooling_candidate_selected_backend": str(stage_pooling_metrics.get("candidate_selected_backend", "")),
+            "pooling_candidate_selected_source": str(stage_pooling_metrics.get("candidate_selected_source", "backend")),
+            "pooling_candidate_selected_coverage_proxy": float(
+                stage_pooling_metrics.get(
+                    "candidate_selected_coverage_proxy",
+                    (stage_pooling_metrics.get("train_metrics") or {}).get("coverage_proxy", 0.0),
+                )
+            ),
+            "pooling_candidate_selected_dynamics_recon_error": float(
+                stage_pooling_metrics.get("candidate_selected_dynamics_recon_error", 0.0)
+            ),
+            "pooling_candidate_selected_max_cluster_size_ratio": float(
+                stage_pooling_metrics.get(
+                    "candidate_selected_max_cluster_size_ratio",
+                    (stage_pooling_metrics.get("train_metrics") or {}).get("max_cluster_size_ratio", 0.0),
+                )
+            ),
+            "pooling_candidate_scores": list(stage_pooling_metrics.get("candidate_scores") or []),
+            "pooling_bridge_enabled": bool(pooling_bridge_enabled if reduction_mode == "pooling" else True),
+            "pooling_bridge_mode": stage_pooling_bridge_mode,
             "pooling_fallback_reason": stage_pooling_fallback_reason,
             "pooling_artifact_path": stage_pooling_artifact_path,
             "floor_passed": bool(floor_passed),
@@ -3187,6 +4675,131 @@ def main() -> None:
             "balance_metrics": balance_metrics,
             "balance_bands": balance_band_effective,
             "balance_margin_detail": balance_margin_detail,
+            "structure_deficit_score": float(
+                _structure_deficit_score(
+                    {
+                        "balance_margin": balance_margin,
+                        "floor_passed": floor_passed,
+                        "cluster_guard_passed": cluster_guard_passed,
+                        "physical_gate_passed": bool(physical_result["passed"]),
+                    }
+                )
+            ),
+            "mandatory_total_metric_count": int(mandatory_total_metric_count),
+            "valid_mandatory_metric_count": int(valid_mandatory_metric_count),
+            "invalid_mandatory_metric_count": int(invalid_mandatory_metric_count),
+            "inactive_mandatory_metric_count": int(inactive_mandatory_metric_count),
+            "active_invalid_mandatory_metric_count": int(active_invalid_mandatory_metric_count),
+            "mandatory_metric_case_pass_rates": {str(k): float(v) for k, v in mandatory_metric_case_pass_rates.items()},
+            "mandatory_metric_valid_case_pass_min_effective": float(mandatory_metric_valid_case_pass_min_effective),
+            "mandatory_metric_validity_mode_effective": str(mandatory_metric_validity_mode_effective),
+            "mandatory_total_gate_unit_count": int(mandatory_total_gate_unit_count),
+            "valid_mandatory_gate_unit_count": int(valid_mandatory_gate_unit_count),
+            "valid_mandatory_gate_unit_count_case_rate": int(valid_mandatory_gate_unit_count_case_rate),
+            "valid_mandatory_gate_unit_count_coverage": int(valid_mandatory_gate_unit_count_coverage),
+            "mandatory_gate_unit_valid_count_shadow_evaluable_ratio": int(
+                mandatory_gate_unit_valid_count_shadow_evaluable_ratio
+            ),
+            "mandatory_gate_unit_min_evaluable_case_ratio_shadow_effective": float(
+                mandatory_gate_unit_min_evaluable_case_ratio_shadow_effective
+            ),
+            "mandatory_validity_basis_effective": str(mandatory_validity_basis_effective),
+            "mandatory_quality_gate_unit_count": int(mandatory_quality_gate_unit_count),
+            "mandatory_quality_metric_count": int(mandatory_quality_metric_count),
+            "active_invalid_mandatory_gate_unit_keys": list(active_invalid_mandatory_gate_unit_keys),
+            "mandatory_gate_unit_case_pass_rates": {
+                str(k): float(v) for k, v in mandatory_gate_unit_case_pass_rates.items()
+            },
+            "mandatory_gate_unit_evaluable_case_rates": {
+                str(k): float(v) for k, v in mandatory_gate_unit_evaluable_case_rates.items()
+            },
+            "mandatory_gate_unit_mode_effective": str(mandatory_gate_unit_mode_effective),
+            "mandatory_species_family_score_mode_effective": str(
+                mandatory_species_family_score_mode_effective
+            ),
+            "mandatory_quality_scope_effective": str(mandatory_quality_scope_effective),
+            "mandatory_tail_scope_effective": str(mandatory_tail_scope_effective),
+            "mandatory_species_family_case_pass_min_effective": float(
+                mandatory_species_family_case_pass_min_effective
+            ),
+            "min_valid_mandatory_count_effective": int(min_valid_mandatory_count_effective),
+            "mandatory_validity_passed": bool(mandatory_validity_passed),
+            "pass_rate_mandatory_case": float(pass_rate_mandatory_case),
+            "pass_rate_mandatory_case_all_units": float(pass_rate_mandatory_case_all_units),
+            "pass_rate_mandatory_case_all_required": float(pass_rate_mandatory_case_all_required),
+            "pass_rate_mandatory_case_ratio_mean": float(pass_rate_mandatory_case_ratio_mean),
+            "pass_rate_mandatory_case_all_required_all_units": float(
+                pass_rate_mandatory_case_all_required_all_units
+            ),
+            "pass_rate_mandatory_case_ratio_mean_all_units": float(
+                pass_rate_mandatory_case_ratio_mean_all_units
+            ),
+            "pass_rate_all_metric_legacy": float(pass_rate_all_metric_legacy),
+            "mandatory_case_mode_effective": str(mandatory_case_mode_effective),
+            "mandatory_case_unit_weight_mode_effective": str(
+                mandatory_case_unit_weight_mode_effective
+            ),
+            "pass_rate_optional_case": float(pass_rate_optional_case),
+            "pass_rate_optional_metric_mean": float(pass_rate_optional_metric_mean),
+            "mean_rel_diff_mandatory": float(mean_rel_diff_mandatory),
+            "mean_rel_diff_mandatory_all_units": float(mean_rel_diff_mandatory_all_units),
+            "mean_rel_diff_mandatory_raw": float(mean_rel_diff_mandatory_raw),
+            "mean_rel_diff_mandatory_family_weighted": float(mean_rel_diff_mandatory_family_weighted),
+            "mean_rel_diff_mandatory_winsorized": float(mean_rel_diff_mandatory_winsorized),
+            "mandatory_rel_outlier_ratio": float(mandatory_rel_outlier_ratio),
+            "mandatory_rel_outlier_ratio_all_units": float(mandatory_rel_outlier_ratio_all_units),
+            "mandatory_rel_outlier_ratio_max_effective": float(mandatory_rel_outlier_ratio_max_effective),
+            "mandatory_rel_diff_p95": float(mandatory_rel_diff_p95),
+            "mandatory_rel_diff_p95_all_units": float(mandatory_rel_diff_p95_all_units),
+            "mandatory_tail_guard_passed": bool(mandatory_tail_guard_passed),
+            "mandatory_tail_guard_triggered": bool(mandatory_tail_guard_triggered),
+            "mandatory_tail_guard_hard_applied": bool(mandatory_tail_guard_hard_applied),
+            "mandatory_tail_guard_mode_effective": str(mandatory_tail_guard_mode_effective),
+            "mandatory_tail_guard_policy_effective": str(mandatory_tail_guard_policy_effective),
+            "mandatory_tail_activation_ratio_min_effective": float(
+                mandatory_tail_activation_ratio_min_effective
+            ),
+            "mandatory_tail_exceed_ref_effective": str(mandatory_tail_exceed_ref_effective),
+            "mandatory_tail_exceed_ratio": float(mandatory_tail_exceed_ratio),
+            "mandatory_tail_rel_diff_max_effective": float(mandatory_tail_rel_diff_max_effective),
+            "mandatory_quality_scope_empty": bool(mandatory_quality_scope_empty),
+            "mandatory_mean_aggregation_effective": str(mandatory_mean_aggregation_effective),
+            "mandatory_mean_mode_effective": str(mandatory_mean_mode_effective),
+            "mean_rel_diff_optional": float(mean_rel_diff_optional),
+            "mean_rel_diff_all_metric_legacy": float(mean_rel_diff_all_metric_legacy),
+            "error_gate_score": float(error_gate_score),
+            "error_gate_passed": bool(error_gate_passed),
+            "coverage_gate_passed": bool(coverage_gate_passed),
+            "mandatory_quality_passed": bool(mandatory_quality_passed),
+            "optional_quality_passed": bool(optional_quality_passed),
+            "mandatory_error_passed": bool(mandatory_error_passed),
+            "optional_error_passed": bool(optional_error_passed),
+            "mandatory_error_include_validity_effective": bool(
+                mandatory_error_include_validity_effective
+            ),
+            "error_fail_reason_primary": str(error_fail_reason_primary),
+            "evaluation_contract_version": str(evaluation_contract_version),
+            "metric_taxonomy_profile_effective": str(metric_taxonomy_profile_effective),
+            "diagnostic_schema_ok": bool(diagnostic_schema_ok),
+            "effective_metric_count": int(effective_metric_count),
+            "suppressed_low_signal_metric_count": int(suppressed_low_signal_metric_count),
+            "metric_clip_guardrail_trigger_ratio": float(stage_metric_clip_guardrail_trigger_ratio),
+            "replay_health_trust_invalid": bool(stage_replay_health_trust_invalid),
+            "metric_drift_raw": float(stage_metric_drift_raw),
+            "metric_drift_effective": float(stage_metric_drift),
+            "metric_drift_effective_cap": float(surrogate_drift_effective_cap_for_eval),
+            "compression_refine_applied": bool(compression_refine_applied),
+            "compression_refine_trials": int(compression_refine_trials),
+            "compression_refine_reaction_delta": int(compression_refine_reaction_delta),
+            "compression_refine_species_delta": int(compression_refine_species_delta),
+            "compression_refine_mode_effective": str(compression_refine_mode_effective),
+            "compression_refine_guard_passed": bool(compression_refine_guard_passed),
+            "timing_stage_s": float(0.0),
+            "timing_pooling_fit_s": float(stage_pooling_fit_elapsed_s),
+            "timing_bridge_s": float(stage_bridge_elapsed_s),
+            "timing_surrogate_eval_s": float(stage_surrogate_elapsed_s),
+            "timing_physical_gate_s": float(stage_physical_elapsed_s),
+            "timing_projection_s": float(stage_projection_elapsed_s),
         }
         if reduction_mode == "pooling":
             pooling_stage_metrics[name] = dict(stage_pooling_metrics)
@@ -3200,9 +4813,9 @@ def main() -> None:
             max_members=int((cfg.get("reporting") or {}).get("max_members_preview", 6)),
         )
         physical_pass = bool(physical_result["passed"])
-        gate_passed = (
-            eval_summary.pass_rate >= min_pass_rate
-            and (eval_summary.mean_rel_diff or 0.0) <= max_mean_rel
+        gate_passed = bool(
+            coverage_gate_passed
+            and error_gate_passed
             and hard_ban_violations == 0
             and (physical_pass if physical_enabled else True)
             and floor_passed
@@ -3252,6 +4865,16 @@ def main() -> None:
                 "balance_margin": float(balance_margin),
                 "coverage_margin": float(coverage_margin),
                 "cluster_size_margin": float(cluster_size_margin),
+                "structure_deficit_score": float(
+                    _structure_deficit_score(
+                        {
+                            "balance_margin": balance_margin,
+                            "floor_passed": floor_passed,
+                            "cluster_guard_passed": cluster_guard_passed,
+                            "physical_gate_passed": physical_pass,
+                        }
+                    )
+                ),
                 "cluster_guard_passed": bool(cluster_guard_passed),
                 "cluster_guard_violations": ";".join(cluster_guard_violations),
                 "balance_dynamic_applied": bool(balance_band_effective.get("balance_dynamic_applied", False)),
@@ -3262,6 +4885,108 @@ def main() -> None:
                 "effective_kfolds": int(split_plan.get("effective_kfolds", 0)),
                 "qoi_metrics_count": int(getattr(eval_summary, "qoi_metrics_count", 0)),
                 "integral_qoi_count": int(qoi_integral_count),
+                "mandatory_total_metric_count": int(mandatory_total_metric_count),
+                "valid_mandatory_metric_count": int(valid_mandatory_metric_count),
+                "invalid_mandatory_metric_count": int(invalid_mandatory_metric_count),
+                "inactive_mandatory_metric_count": int(inactive_mandatory_metric_count),
+                "active_invalid_mandatory_metric_count": int(active_invalid_mandatory_metric_count),
+                "mandatory_metric_case_pass_rates": {
+                    str(k): float(v) for k, v in mandatory_metric_case_pass_rates.items()
+                },
+                "mandatory_metric_valid_case_pass_min_effective": float(mandatory_metric_valid_case_pass_min_effective),
+                "mandatory_metric_validity_mode_effective": str(mandatory_metric_validity_mode_effective),
+                "mandatory_total_gate_unit_count": int(mandatory_total_gate_unit_count),
+                "valid_mandatory_gate_unit_count": int(valid_mandatory_gate_unit_count),
+                "valid_mandatory_gate_unit_count_case_rate": int(valid_mandatory_gate_unit_count_case_rate),
+                "valid_mandatory_gate_unit_count_coverage": int(valid_mandatory_gate_unit_count_coverage),
+                "mandatory_gate_unit_valid_count_shadow_evaluable_ratio": int(
+                    mandatory_gate_unit_valid_count_shadow_evaluable_ratio
+                ),
+                "mandatory_gate_unit_min_evaluable_case_ratio_shadow_effective": float(
+                    mandatory_gate_unit_min_evaluable_case_ratio_shadow_effective
+                ),
+                "mandatory_validity_basis_effective": str(mandatory_validity_basis_effective),
+                "mandatory_quality_gate_unit_count": int(mandatory_quality_gate_unit_count),
+                "mandatory_quality_metric_count": int(mandatory_quality_metric_count),
+                "active_invalid_mandatory_gate_unit_keys": list(active_invalid_mandatory_gate_unit_keys),
+                "mandatory_gate_unit_case_pass_rates": {
+                    str(k): float(v) for k, v in mandatory_gate_unit_case_pass_rates.items()
+                },
+                "mandatory_gate_unit_evaluable_case_rates": {
+                    str(k): float(v) for k, v in mandatory_gate_unit_evaluable_case_rates.items()
+                },
+                "mandatory_gate_unit_mode_effective": str(mandatory_gate_unit_mode_effective),
+                "mandatory_species_family_score_mode_effective": str(
+                    mandatory_species_family_score_mode_effective
+                ),
+                "mandatory_quality_scope_effective": str(mandatory_quality_scope_effective),
+                "mandatory_tail_scope_effective": str(mandatory_tail_scope_effective),
+                "mandatory_species_family_case_pass_min_effective": float(
+                    mandatory_species_family_case_pass_min_effective
+                ),
+                "min_valid_mandatory_count_effective": int(min_valid_mandatory_count_effective),
+                "mandatory_validity_passed": bool(mandatory_validity_passed),
+                "pass_rate_mandatory_case": float(pass_rate_mandatory_case),
+                "pass_rate_mandatory_case_all_units": float(pass_rate_mandatory_case_all_units),
+                "pass_rate_mandatory_case_all_required": float(pass_rate_mandatory_case_all_required),
+                "pass_rate_mandatory_case_ratio_mean": float(pass_rate_mandatory_case_ratio_mean),
+                "pass_rate_mandatory_case_all_required_all_units": float(
+                    pass_rate_mandatory_case_all_required_all_units
+                ),
+                "pass_rate_mandatory_case_ratio_mean_all_units": float(
+                    pass_rate_mandatory_case_ratio_mean_all_units
+                ),
+                "pass_rate_all_metric_legacy": float(pass_rate_all_metric_legacy),
+                "mandatory_case_mode_effective": str(mandatory_case_mode_effective),
+                "mandatory_case_unit_weight_mode_effective": str(
+                    mandatory_case_unit_weight_mode_effective
+                ),
+                "pass_rate_optional_case": float(pass_rate_optional_case),
+                "pass_rate_optional_metric_mean": float(pass_rate_optional_metric_mean),
+                "mean_rel_diff_mandatory": float(mean_rel_diff_mandatory),
+                "mean_rel_diff_mandatory_all_units": float(mean_rel_diff_mandatory_all_units),
+                "mean_rel_diff_mandatory_raw": float(mean_rel_diff_mandatory_raw),
+                "mean_rel_diff_mandatory_family_weighted": float(mean_rel_diff_mandatory_family_weighted),
+                "mean_rel_diff_mandatory_winsorized": float(mean_rel_diff_mandatory_winsorized),
+                "mandatory_rel_outlier_ratio": float(mandatory_rel_outlier_ratio),
+                "mandatory_rel_outlier_ratio_all_units": float(mandatory_rel_outlier_ratio_all_units),
+                "mandatory_rel_outlier_ratio_max_effective": float(mandatory_rel_outlier_ratio_max_effective),
+                "mandatory_rel_diff_p95": float(mandatory_rel_diff_p95),
+                "mandatory_rel_diff_p95_all_units": float(mandatory_rel_diff_p95_all_units),
+                "mandatory_tail_guard_passed": bool(mandatory_tail_guard_passed),
+                "mandatory_tail_guard_triggered": bool(mandatory_tail_guard_triggered),
+                "mandatory_tail_guard_hard_applied": bool(mandatory_tail_guard_hard_applied),
+                "mandatory_tail_guard_mode_effective": str(mandatory_tail_guard_mode_effective),
+                "mandatory_tail_guard_policy_effective": str(mandatory_tail_guard_policy_effective),
+                "mandatory_tail_activation_ratio_min_effective": float(
+                    mandatory_tail_activation_ratio_min_effective
+                ),
+                "mandatory_tail_exceed_ref_effective": str(mandatory_tail_exceed_ref_effective),
+                "mandatory_tail_exceed_ratio": float(mandatory_tail_exceed_ratio),
+                "mandatory_tail_rel_diff_max_effective": float(mandatory_tail_rel_diff_max_effective),
+                "mandatory_quality_scope_empty": bool(mandatory_quality_scope_empty),
+                "mandatory_mean_aggregation_effective": str(mandatory_mean_aggregation_effective),
+                "mandatory_mean_mode_effective": str(mandatory_mean_mode_effective),
+                "mean_rel_diff_optional": float(mean_rel_diff_optional),
+                "mean_rel_diff_all_metric_legacy": float(mean_rel_diff_all_metric_legacy),
+                "error_gate_score": float(error_gate_score),
+                "error_gate_passed": bool(error_gate_passed),
+                "coverage_gate_passed": bool(coverage_gate_passed),
+                "mandatory_quality_passed": bool(mandatory_quality_passed),
+                "optional_quality_passed": bool(optional_quality_passed),
+                "mandatory_error_passed": bool(mandatory_error_passed),
+                "optional_error_passed": bool(optional_error_passed),
+                "mandatory_error_include_validity_effective": bool(
+                    mandatory_error_include_validity_effective
+                ),
+                "error_fail_reason_primary": str(error_fail_reason_primary),
+                "evaluation_contract_version": str(evaluation_contract_version),
+                "metric_taxonomy_profile_effective": str(metric_taxonomy_profile_effective),
+                "diagnostic_schema_ok": bool(diagnostic_schema_ok),
+                "effective_metric_count": int(effective_metric_count),
+                "suppressed_low_signal_metric_count": int(suppressed_low_signal_metric_count),
+                "metric_clip_guardrail_trigger_ratio": float(stage_metric_clip_guardrail_trigger_ratio),
+                "replay_health_trust_invalid": bool(stage_replay_health_trust_invalid),
                 "gate_passed": bool(gate_passed),
                 "target_ratio": target_ratio,
                 "penalty_scale": penalty_scale,
@@ -3273,34 +4998,188 @@ def main() -> None:
                 "overall_candidates": int(overall_candidates),
                 "overall_selected": int(overall_selected),
                 "overall_select_ratio": float(overall_select_ratio),
+                "metric_drift_raw": float(stage_metric_drift_raw),
                 "metric_drift_effective": float(stage_metric_drift),
+                "metric_drift_effective_cap": float(surrogate_drift_effective_cap_for_eval),
+                "compression_refine_applied": bool(compression_refine_applied),
+                "compression_refine_trials": int(compression_refine_trials),
+                "compression_refine_reaction_delta": int(compression_refine_reaction_delta),
+                "compression_refine_species_delta": int(compression_refine_species_delta),
+                "compression_refine_mode_effective": str(compression_refine_mode_effective),
+                "compression_refine_guard_passed": bool(compression_refine_guard_passed),
                 "learnckpp_fallback_reason": learnckpp_fallback_reason,
                 "learnckpp_target_keep_ratio": float(learnckpp_target_keep_ratio),
+                "structure_feedback_multiplier": float(structure_feedback_multiplier),
                 "pooling_clusters": int((stage_pooling_metrics.get("train_metrics") or {}).get("n_clusters", mapping.S.shape[1])),
                 "pooling_constraint_loss": float((stage_pooling_metrics.get("train_metrics") or {}).get("constraint_loss", 0.0)),
                 "pooling_hard_ban_violations": int(stage_pooling_metrics.get("hard_ban_violations", 0)),
+                "pooling_candidate_count": int(stage_pooling_metrics.get("candidate_count", 0)),
+                "pooling_candidate_unique_count": int(stage_pooling_metrics.get("candidate_unique_count", 0)),
+                "pooling_candidate_selected_backend": str(stage_pooling_metrics.get("candidate_selected_backend", "")),
+                "pooling_candidate_selected_source": str(stage_pooling_metrics.get("candidate_selected_source", "backend")),
+                "pooling_candidate_selected_coverage_proxy": float(
+                    stage_pooling_metrics.get(
+                        "candidate_selected_coverage_proxy",
+                        (stage_pooling_metrics.get("train_metrics") or {}).get("coverage_proxy", 0.0),
+                    )
+                ),
+                "pooling_candidate_selected_dynamics_recon_error": float(
+                    stage_pooling_metrics.get("candidate_selected_dynamics_recon_error", 0.0)
+                ),
+                "pooling_candidate_selected_max_cluster_size_ratio": float(
+                    stage_pooling_metrics.get(
+                        "candidate_selected_max_cluster_size_ratio",
+                        (stage_pooling_metrics.get("train_metrics") or {}).get("max_cluster_size_ratio", 0.0),
+                    )
+                ),
+                "pooling_candidate_scores": list(stage_pooling_metrics.get("candidate_scores") or []),
+                "pooling_bridge_enabled": bool(pooling_bridge_enabled if reduction_mode == "pooling" else True),
+                "pooling_bridge_mode": stage_pooling_bridge_mode,
                 "pooling_artifact_path": stage_pooling_artifact_path,
+                "timing_stage_s": float(0.0),
+                "timing_pooling_fit_s": float(stage_pooling_fit_elapsed_s),
+                "timing_bridge_s": float(stage_bridge_elapsed_s),
+                "timing_surrogate_eval_s": float(stage_surrogate_elapsed_s),
+                "timing_physical_gate_s": float(stage_physical_elapsed_s),
+                "timing_projection_s": float(stage_projection_elapsed_s),
                 "_floors": floors,
                 "_selection_max_mean_rel": max_mean_rel,
+                "_selection_use_raw_drift": bool(surrogate_drift_selection_use_raw),
+                "_selection_raw_drift_cap": float(surrogate_drift_raw_cap_for_selection),
             }
         )
+        stage_elapsed_s = float(pytime.perf_counter() - stage_started)
+        timing_stage_s[name] = stage_elapsed_s
+        timing_pooling_fit_s[name] = float(stage_pooling_fit_elapsed_s)
+        timing_bridge_s[name] = float(stage_bridge_elapsed_s)
+        timing_surrogate_eval_s[name] = float(stage_surrogate_elapsed_s)
+        timing_physical_gate_s[name] = float(stage_physical_elapsed_s)
+        timing_projection_s[name] = float(stage_projection_elapsed_s)
+        stage_rows[-1]["timing_stage_s"] = stage_elapsed_s
+        gate_evidence_by_stage[name]["timing_stage_s"] = stage_elapsed_s
+        runtime_guard.mark_progress(f"stage_{name}_completed")
         prev_stage_mean_rel = float(eval_summary.mean_rel_diff or 0.0)
         prev_stage_physical = dict(physical_result)
+        prev_stage_structure = {
+            "domain_deficit": float(domain_deficit),
+            "balance_margin": float(balance_margin),
+            "floor_passed": bool(floor_passed),
+            "balance_passed": bool(balance_passed),
+        }
 
     selection_result = _select_stage_physics_first(stage_rows, cfg)
     selected = dict(selection_result["selected"])
-    for key in ("_floors", "_selection_max_mean_rel"):
+    for key in ("_floors", "_selection_max_mean_rel", "_selection_use_raw_drift", "_selection_raw_drift_cap"):
         selected.pop(key, None)
     for row in stage_rows:
         row.pop("_floors", None)
         row.pop("_selection_max_mean_rel", None)
+        row.pop("_selection_use_raw_drift", None)
+        row.pop("_selection_raw_drift_cap", None)
+        row_blockers = _derive_blockers(row)
+        row.update(row_blockers)
+        stage_name = str(row.get("stage") or "")
+        if stage_name:
+            gate_evidence_by_stage.setdefault(stage_name, {}).update(row_blockers)
     report_dir = Path(cfg.get("report_dir", "reports")) / args.run_id
     selected_stage_name = str(selected["stage"])
     selected_gate_evidence = dict(gate_evidence_by_stage.get(selected_stage_name) or {})
+    selected_blockers = _derive_blockers(selected)
+    selected.update(selected_blockers)
+    selected["selection_pool_kind"] = str(selected.get("selection_pool_kind", "all"))
+    selected["structure_deficit_score"] = float(selected.get("structure_deficit_score", 0.0))
+    selected["metric_drift_raw"] = float(selected.get("metric_drift_raw", selected.get("metric_drift_effective", 1.0)))
+    selected["metric_drift_effective_cap"] = float(
+        selected.get("metric_drift_effective_cap", surrogate_drift_effective_cap_for_eval)
+    )
+    selected["selection_quality_score_raw_drift"] = float(
+        selected.get("selection_quality_score_raw_drift", _selection_quality_score_raw_drift(selected))
+    )
+    selected["compression_refine_applied"] = bool(selected.get("compression_refine_applied", False))
+    selected["compression_refine_trials"] = int(selected.get("compression_refine_trials", 0) or 0)
+    selected["compression_refine_reaction_delta"] = int(selected.get("compression_refine_reaction_delta", 0) or 0)
+    selected["compression_refine_species_delta"] = int(selected.get("compression_refine_species_delta", 0) or 0)
+    selected["compression_refine_mode_effective"] = str(selected.get("compression_refine_mode_effective", "none"))
+    selected["compression_refine_guard_passed"] = bool(selected.get("compression_refine_guard_passed", True))
+    selected_gate_evidence["selection_pool_kind"] = str(selected.get("selection_pool_kind", "all"))
+    selected_gate_evidence["structure_deficit_score"] = float(selected.get("structure_deficit_score", 0.0))
+    selected_gate_evidence["metric_drift_raw"] = float(selected.get("metric_drift_raw", 1.0))
+    selected_gate_evidence["metric_drift_effective_cap"] = float(
+        selected.get("metric_drift_effective_cap", surrogate_drift_effective_cap_for_eval)
+    )
+    selected_gate_evidence["selection_quality_score_raw_drift"] = float(
+        selected.get("selection_quality_score_raw_drift", 0.0)
+    )
+    selected_gate_evidence["compression_refine_applied"] = bool(selected.get("compression_refine_applied", False))
+    selected_gate_evidence["compression_refine_trials"] = int(selected.get("compression_refine_trials", 0))
+    selected_gate_evidence["compression_refine_reaction_delta"] = int(
+        selected.get("compression_refine_reaction_delta", 0)
+    )
+    selected_gate_evidence["compression_refine_species_delta"] = int(
+        selected.get("compression_refine_species_delta", 0)
+    )
+    selected_gate_evidence["compression_refine_mode_effective"] = str(
+        selected.get("compression_refine_mode_effective", "none")
+    )
+    selected_gate_evidence["compression_refine_guard_passed"] = bool(
+        selected.get("compression_refine_guard_passed", True)
+    )
+    selected_gate_evidence["evaluation_contract_version"] = str(
+        selected.get("evaluation_contract_version", contract_cfg.get("version", "v1"))
+    )
+    selected_gate_evidence["metric_taxonomy_profile_effective"] = str(
+        selected.get("metric_taxonomy_profile_effective", metric_taxonomy_resolved.get("profile", "legacy_builtin"))
+    )
+    selected_gate_evidence["diagnostic_schema_ok"] = bool(selected.get("diagnostic_schema_ok", True))
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["selection_pool_kind"] = str(
+        selected.get("selection_pool_kind", "all")
+    )
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["structure_deficit_score"] = float(
+        selected.get("structure_deficit_score", 0.0)
+    )
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["metric_drift_raw"] = float(
+        selected.get("metric_drift_raw", 1.0)
+    )
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["metric_drift_effective_cap"] = float(
+        selected.get("metric_drift_effective_cap", surrogate_drift_effective_cap_for_eval)
+    )
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["selection_quality_score_raw_drift"] = float(
+        selected.get("selection_quality_score_raw_drift", 0.0)
+    )
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["compression_refine_applied"] = bool(
+        selected.get("compression_refine_applied", False)
+    )
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["compression_refine_trials"] = int(
+        selected.get("compression_refine_trials", 0)
+    )
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["compression_refine_reaction_delta"] = int(
+        selected.get("compression_refine_reaction_delta", 0)
+    )
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["compression_refine_species_delta"] = int(
+        selected.get("compression_refine_species_delta", 0)
+    )
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["compression_refine_mode_effective"] = str(
+        selected.get("compression_refine_mode_effective", "none")
+    )
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["compression_refine_guard_passed"] = bool(
+        selected.get("compression_refine_guard_passed", True)
+    )
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["evaluation_contract_version"] = str(
+        selected.get("evaluation_contract_version", contract_cfg.get("version", "v1"))
+    )
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["metric_taxonomy_profile_effective"] = str(
+        selected.get("metric_taxonomy_profile_effective", metric_taxonomy_resolved.get("profile", "legacy_builtin"))
+    )
+    gate_evidence_by_stage.setdefault(selected_stage_name, {})["diagnostic_schema_ok"] = bool(
+        selected.get("diagnostic_schema_ok", True)
+    )
+    selected_gate_evidence.update(selected_blockers)
     pareto_candidates = [dict(r) for r in list(selection_result.get("pareto_candidates") or [])]
     for row in pareto_candidates:
         row.pop("_floors", None)
         row.pop("_selection_max_mean_rel", None)
+        row.pop("_selection_use_raw_drift", None)
+        row.pop("_selection_raw_drift_cap", None)
     candidate_trend = [
         {
             "stage": str(row.get("stage")),
@@ -3308,12 +5187,30 @@ def main() -> None:
             "gas_species_after": int(row.get("gas_species_after", 0)),
             "surface_species_after": int(row.get("surface_species_after", 0)),
             "reactions_after": int(row.get("reactions_after", 0)),
-            "gas_reactions_after": int(row.get("gas_reactions_after", 0)),
-            "surface_reactions_after": int(row.get("surface_reactions_after", 0)),
+            "gas_reactions_after": (
+                None
+                if row.get("gas_reactions_after") is None
+                else int(row.get("gas_reactions_after", 0))
+            ),
+            "surface_reactions_after": (
+                None
+                if row.get("surface_reactions_after") is None
+                else int(row.get("surface_reactions_after", 0))
+            ),
             "overall_candidates": int(row.get("overall_candidates", 0)),
             "overall_selected": int(row.get("overall_selected", 0)),
             "overall_select_ratio": float(row.get("overall_select_ratio", 0.0)),
+            "metric_drift_raw": float(row.get("metric_drift_raw", row.get("metric_drift_effective", 1.0))),
+            "metric_drift_effective_cap": float(
+                row.get("metric_drift_effective_cap", surrogate_drift_effective_cap_for_eval)
+            ),
             "mean_rel_diff": float(row.get("mean_rel_diff", 0.0)),
+            "compression_refine_applied": bool(row.get("compression_refine_applied", False)),
+            "compression_refine_trials": int(row.get("compression_refine_trials", 0)),
+            "compression_refine_reaction_delta": int(row.get("compression_refine_reaction_delta", 0)),
+            "compression_refine_species_delta": int(row.get("compression_refine_species_delta", 0)),
+            "compression_refine_mode_effective": str(row.get("compression_refine_mode_effective", "none")),
+            "compression_refine_guard_passed": bool(row.get("compression_refine_guard_passed", True)),
             "floor_passed": bool(row.get("floor_passed", True)),
             "balance_gate_passed": bool(row.get("balance_gate_passed", True)),
             "cluster_guard_passed": bool(row.get("cluster_guard_passed", True)),
@@ -3325,12 +5222,209 @@ def main() -> None:
             "max_cluster_size_ratio": float(row.get("max_cluster_size_ratio", 0.0)),
             "balance_mode": str(row.get("balance_mode", balance_bands.get("balance_mode", "binary"))),
             "selection_score": float(row.get("selection_score", 0.0)),
+            "selection_quality_score_raw_drift": float(row.get("selection_quality_score_raw_drift", 0.0)),
+            "selection_pool_kind": str(row.get("selection_pool_kind", "all")),
+            "structure_deficit_score": float(row.get("structure_deficit_score", 0.0)),
+            "pooling_candidate_count": int(row.get("pooling_candidate_count", 0)),
+            "pooling_candidate_unique_count": int(row.get("pooling_candidate_unique_count", 0)),
+            "pooling_candidate_selected_backend": str(row.get("pooling_candidate_selected_backend", "")),
+            "pooling_candidate_selected_source": str(row.get("pooling_candidate_selected_source", "backend")),
+            "pooling_candidate_selected_coverage_proxy": float(
+                row.get("pooling_candidate_selected_coverage_proxy", 0.0)
+            ),
+            "pooling_candidate_selected_dynamics_recon_error": float(
+                row.get("pooling_candidate_selected_dynamics_recon_error", 0.0)
+            ),
+            "pooling_candidate_selected_max_cluster_size_ratio": float(
+                row.get("pooling_candidate_selected_max_cluster_size_ratio", 0.0)
+            ),
+            "pooling_candidate_scores": list(row.get("pooling_candidate_scores") or []),
             "balance_margin": float(row.get("balance_margin", 0.0)),
             "balance_dynamic_applied": bool(row.get("balance_dynamic_applied", False)),
             "balance_dynamic_complexity": float(row.get("balance_dynamic_complexity", 0.0)),
             "rs_upper_effective": float(row.get("rs_upper_effective", 0.0)),
             "active_cov_effective_floor": float(row.get("active_cov_effective_floor", 0.0)),
-        }
+            "mandatory_total_metric_count": int(row.get("mandatory_total_metric_count", 0)),
+            "valid_mandatory_metric_count": int(row.get("valid_mandatory_metric_count", 0)),
+            "mandatory_validity_passed": bool(row.get("mandatory_validity_passed", True)),
+            "inactive_mandatory_metric_count": int(row.get("inactive_mandatory_metric_count", 0)),
+            "active_invalid_mandatory_metric_count": int(row.get("active_invalid_mandatory_metric_count", 0)),
+            "mandatory_metric_case_pass_rates": dict(row.get("mandatory_metric_case_pass_rates") or {}),
+            "mandatory_metric_valid_case_pass_min_effective": float(
+                row.get("mandatory_metric_valid_case_pass_min_effective", 0.0)
+            ),
+            "mandatory_metric_validity_mode_effective": str(
+                row.get("mandatory_metric_validity_mode_effective", "case_pass_rate")
+            ),
+            "mandatory_total_gate_unit_count": int(row.get("mandatory_total_gate_unit_count", 0)),
+            "valid_mandatory_gate_unit_count": int(row.get("valid_mandatory_gate_unit_count", 0)),
+            "valid_mandatory_gate_unit_count_case_rate": int(
+                row.get("valid_mandatory_gate_unit_count_case_rate", row.get("valid_mandatory_gate_unit_count", 0))
+            ),
+            "valid_mandatory_gate_unit_count_coverage": int(
+                row.get("valid_mandatory_gate_unit_count_coverage", row.get("valid_mandatory_gate_unit_count", 0))
+            ),
+            "mandatory_gate_unit_valid_count_shadow_evaluable_ratio": int(
+                row.get("mandatory_gate_unit_valid_count_shadow_evaluable_ratio", 0)
+            ),
+            "mandatory_gate_unit_min_evaluable_case_ratio_shadow_effective": float(
+                row.get("mandatory_gate_unit_min_evaluable_case_ratio_shadow_effective", 0.25)
+            ),
+            "mandatory_validity_basis_effective": str(
+                row.get("mandatory_validity_basis_effective", "coverage_evaluable")
+            ),
+            "mandatory_quality_gate_unit_count": int(row.get("mandatory_quality_gate_unit_count", 0)),
+            "mandatory_quality_metric_count": int(row.get("mandatory_quality_metric_count", 0)),
+            "active_invalid_mandatory_gate_unit_keys": list(
+                row.get("active_invalid_mandatory_gate_unit_keys") or []
+            ),
+            "mandatory_gate_unit_case_pass_rates": dict(row.get("mandatory_gate_unit_case_pass_rates") or {}),
+            "mandatory_gate_unit_evaluable_case_rates": dict(
+                row.get("mandatory_gate_unit_evaluable_case_rates") or {}
+            ),
+            "mandatory_gate_unit_mode_effective": str(
+                row.get("mandatory_gate_unit_mode_effective", "species_family_quorum")
+            ),
+            "mandatory_species_family_score_mode_effective": str(
+                row.get("mandatory_species_family_score_mode_effective", "uniform")
+            ),
+            "mandatory_quality_scope_effective": str(
+                row.get("mandatory_quality_scope_effective", "valid_only")
+            ),
+            "mandatory_tail_scope_effective": str(
+                row.get("mandatory_tail_scope_effective", "quality_scope")
+            ),
+            "mandatory_species_family_case_pass_min_effective": float(
+                row.get("mandatory_species_family_case_pass_min_effective", 0.67)
+            ),
+            "pass_rate_mandatory_case": float(row.get("pass_rate_mandatory_case", row.get("pass_rate", 0.0))),
+            "pass_rate_mandatory_case_all_units": float(
+                row.get(
+                    "pass_rate_mandatory_case_all_units",
+                    row.get("pass_rate_mandatory_case", row.get("pass_rate", 0.0)),
+                )
+            ),
+            "pass_rate_mandatory_case_all_required": float(
+                row.get("pass_rate_mandatory_case_all_required", row.get("pass_rate_mandatory_case", row.get("pass_rate", 0.0)))
+            ),
+            "pass_rate_mandatory_case_ratio_mean": float(
+                row.get("pass_rate_mandatory_case_ratio_mean", row.get("pass_rate_mandatory_case", row.get("pass_rate", 0.0)))
+            ),
+            "pass_rate_mandatory_case_all_required_all_units": float(
+                row.get(
+                    "pass_rate_mandatory_case_all_required_all_units",
+                    row.get("pass_rate_mandatory_case_all_required", row.get("pass_rate_mandatory_case", row.get("pass_rate", 0.0))),
+                )
+            ),
+            "pass_rate_mandatory_case_ratio_mean_all_units": float(
+                row.get(
+                    "pass_rate_mandatory_case_ratio_mean_all_units",
+                    row.get("pass_rate_mandatory_case_ratio_mean", row.get("pass_rate_mandatory_case", row.get("pass_rate", 0.0))),
+                )
+            ),
+            "pass_rate_all_metric_legacy": float(
+                row.get("pass_rate_all_metric_legacy", row.get("pass_rate", 0.0))
+            ),
+            "mandatory_case_mode_effective": str(row.get("mandatory_case_mode_effective", "ratio_mean")),
+            "mandatory_case_unit_weight_mode_effective": str(
+                row.get("mandatory_case_unit_weight_mode_effective", "uniform")
+            ),
+            "pass_rate_optional_case": float(row.get("pass_rate_optional_case", row.get("pass_rate", 0.0))),
+            "pass_rate_optional_metric_mean": float(
+                row.get("pass_rate_optional_metric_mean", row.get("pass_rate", 0.0))
+            ),
+            "mean_rel_diff_mandatory": float(row.get("mean_rel_diff_mandatory", row.get("mean_rel_diff", 0.0))),
+            "mean_rel_diff_mandatory_all_units": float(
+                row.get("mean_rel_diff_mandatory_all_units", row.get("mean_rel_diff_mandatory", row.get("mean_rel_diff", 0.0)))
+            ),
+            "mean_rel_diff_mandatory_raw": float(
+                row.get("mean_rel_diff_mandatory_raw", row.get("mean_rel_diff_mandatory", row.get("mean_rel_diff", 0.0)))
+            ),
+            "mean_rel_diff_mandatory_family_weighted": float(
+                row.get(
+                    "mean_rel_diff_mandatory_family_weighted",
+                    row.get("mean_rel_diff_mandatory", row.get("mean_rel_diff", 0.0)),
+                )
+            ),
+            "mean_rel_diff_mandatory_winsorized": float(
+                row.get(
+                    "mean_rel_diff_mandatory_winsorized",
+                    row.get("mean_rel_diff_mandatory", row.get("mean_rel_diff", 0.0)),
+                )
+            ),
+            "mandatory_rel_outlier_ratio": float(row.get("mandatory_rel_outlier_ratio", 0.0)),
+            "mandatory_rel_outlier_ratio_all_units": float(
+                row.get("mandatory_rel_outlier_ratio_all_units", row.get("mandatory_rel_outlier_ratio", 0.0))
+            ),
+            "mandatory_rel_outlier_ratio_max_effective": float(
+                row.get("mandatory_rel_outlier_ratio_max_effective", 0.20)
+            ),
+            "mandatory_rel_diff_p95": float(row.get("mandatory_rel_diff_p95", 0.0)),
+            "mandatory_rel_diff_p95_all_units": float(
+                row.get("mandatory_rel_diff_p95_all_units", row.get("mandatory_rel_diff_p95", 0.0))
+            ),
+            "mandatory_tail_guard_passed": bool(row.get("mandatory_tail_guard_passed", True)),
+            "mandatory_tail_guard_triggered": bool(row.get("mandatory_tail_guard_triggered", False)),
+            "mandatory_tail_guard_hard_applied": bool(row.get("mandatory_tail_guard_hard_applied", False)),
+            "mandatory_tail_guard_mode_effective": str(
+                row.get("mandatory_tail_guard_mode_effective", "p95")
+            ),
+            "mandatory_tail_guard_policy_effective": str(
+                row.get("mandatory_tail_guard_policy_effective", "conditional_hard")
+            ),
+            "mandatory_tail_activation_ratio_min_effective": float(
+                row.get("mandatory_tail_activation_ratio_min_effective", 0.10)
+            ),
+            "mandatory_tail_exceed_ref_effective": str(
+                row.get("mandatory_tail_exceed_ref_effective", "tail_max")
+            ),
+            "mandatory_tail_exceed_ratio": float(row.get("mandatory_tail_exceed_ratio", 0.0)),
+            "mandatory_tail_rel_diff_max_effective": float(
+                row.get("mandatory_tail_rel_diff_max_effective", 1.50)
+            ),
+            "mandatory_quality_scope_empty": bool(row.get("mandatory_quality_scope_empty", False)),
+            "mandatory_mean_aggregation_effective": str(row.get("mandatory_mean_aggregation_effective", "raw")),
+            "mandatory_mean_mode_effective": str(row.get("mandatory_mean_mode_effective", "winsorized")),
+            "mean_rel_diff_optional": float(row.get("mean_rel_diff_optional", row.get("mean_rel_diff", 0.0))),
+            "mean_rel_diff_all_metric_legacy": float(
+                row.get("mean_rel_diff_all_metric_legacy", row.get("mean_rel_diff", 0.0))
+            ),
+            "error_gate_score": float(row.get("error_gate_score", 0.0)),
+            "error_gate_passed": bool(row.get("error_gate_passed", row.get("gate_passed", False))),
+            "coverage_gate_passed": bool(row.get("coverage_gate_passed", row.get("mandatory_validity_passed", True))),
+            "mandatory_quality_passed": bool(row.get("mandatory_quality_passed", row.get("mandatory_error_passed", True))),
+            "optional_quality_passed": bool(row.get("optional_quality_passed", row.get("optional_error_passed", True))),
+            "mandatory_error_passed": bool(row.get("mandatory_error_passed", row.get("error_gate_passed", True))),
+            "optional_error_passed": bool(row.get("optional_error_passed", True)),
+            "mandatory_error_include_validity_effective": bool(
+                row.get("mandatory_error_include_validity_effective", False)
+            ),
+            "error_fail_reason_primary": str(row.get("error_fail_reason_primary", "none")),
+            "evaluation_contract_version": str(
+                row.get("evaluation_contract_version", contract_cfg.get("version", "v1"))
+            ),
+            "metric_taxonomy_profile_effective": str(
+                row.get(
+                    "metric_taxonomy_profile_effective",
+                    metric_taxonomy_resolved.get("profile", "legacy_builtin"),
+                )
+            ),
+            "diagnostic_schema_ok": bool(row.get("diagnostic_schema_ok", True)),
+            "effective_metric_count": int(row.get("effective_metric_count", row.get("qoi_metrics_count", 0))),
+            "suppressed_low_signal_metric_count": int(row.get("suppressed_low_signal_metric_count", 0)),
+            "metric_clip_guardrail_trigger_ratio": float(row.get("metric_clip_guardrail_trigger_ratio", 0.0)),
+            "replay_health_trust_invalid": bool(row.get("replay_health_trust_invalid", False)),
+            "structure_feedback_multiplier": float(row.get("structure_feedback_multiplier", 1.0)),
+            "primary_blocker_layer": str(row.get("primary_blocker_layer", "none")),
+            "secondary_blockers": list(row.get("secondary_blockers") or []),
+            "validity_fail_reason_primary": str(row.get("validity_fail_reason_primary", "none")),
+            "timing_stage_s": float(row.get("timing_stage_s", 0.0)),
+            "timing_pooling_fit_s": float(row.get("timing_pooling_fit_s", 0.0)),
+            "timing_bridge_s": float(row.get("timing_bridge_s", 0.0)),
+            "timing_surrogate_eval_s": float(row.get("timing_surrogate_eval_s", 0.0)),
+            "timing_physical_gate_s": float(row.get("timing_physical_gate_s", 0.0)),
+            "timing_projection_s": float(row.get("timing_projection_s", 0.0)),
+            }
         for row in stage_rows
     ]
     selected["balance_metrics"] = {
@@ -3349,13 +5443,48 @@ def main() -> None:
             "balance_dynamic_applied": bool(selected.get("balance_dynamic_applied", False)),
             "balance_dynamic_complexity": float(selected.get("balance_dynamic_complexity", 0.0)),
             "rs_upper_effective": float(selected.get("rs_upper_effective", 0.0)),
-            "active_cov_effective_floor": float(selected.get("active_cov_effective_floor", 0.0)),
-        }
+        "active_cov_effective_floor": float(selected.get("active_cov_effective_floor", 0.0)),
+    }
+    timing_total_s = float(pytime.perf_counter() - total_started)
+    run_finished_at = _utc_now_iso()
+    runtime_meta["finished_at"] = run_finished_at
+    selected["timing_total_s"] = timing_total_s
+    selected["evaluation_contract_version"] = str(
+        selected.get("evaluation_contract_version", contract_cfg.get("version", "v1"))
+    )
+    selected["metric_taxonomy_profile_effective"] = str(
+        selected.get("metric_taxonomy_profile_effective", metric_taxonomy_resolved.get("profile", "legacy_builtin"))
+    )
+    selected["diagnostic_schema_ok"] = bool(selected.get("diagnostic_schema_ok", True))
 
     summary_payload = {
         "gate_passed": bool(selected["gate_passed"]),
         "hard_ban_violations": int(selected["hard_ban_violations"]),
+        "primary_blocker_layer": str(selected.get("primary_blocker_layer", "none")),
+        "secondary_blockers": list(selected.get("secondary_blockers") or []),
+        "validity_fail_reason_primary": str(selected.get("validity_fail_reason_primary", "none")),
+        "error_fail_reason_primary": str(selected.get("error_fail_reason_primary", "none")),
+        "evaluation_contract_version": str(
+            selected.get("evaluation_contract_version", contract_cfg.get("version", "v1"))
+        ),
+        "metric_taxonomy_profile_effective": str(
+            selected.get("metric_taxonomy_profile_effective", metric_taxonomy_resolved.get("profile", "legacy_builtin"))
+        ),
+        "diagnostic_schema_ok": bool(selected.get("diagnostic_schema_ok", True)),
         "reduction_mode": reduction_mode,
+        "timing_total_s": timing_total_s,
+        "timing_stage_s": timing_stage_s,
+        "timing_pooling_fit_s": timing_pooling_fit_s,
+        "timing_bridge_s": timing_bridge_s,
+        "timing_surrogate_eval_s": timing_surrogate_eval_s,
+        "timing_physical_gate_s": timing_physical_gate_s,
+        "timing_projection_s": timing_projection_s,
+        "runtime": runtime_meta,
+        "config_hash": runtime_meta.get("config_hash"),
+        "git_commit": runtime_meta.get("git_commit"),
+        "pid": runtime_meta.get("pid"),
+        "started_at": runtime_meta.get("started_at"),
+        "finished_at": runtime_meta.get("finished_at"),
         "gate": {
             "min_pass_rate": min_pass_rate,
             "max_mean_rel_diff": max_mean_rel,
@@ -3374,6 +5503,13 @@ def main() -> None:
         "surrogate_split": split_plan,
         "qoi_integral_count": int(qoi_integral_count),
         "qoi_integral_keys": qoi_integral_keys,
+        "evaluation_contract": dict(contract_cfg),
+        "metric_taxonomy": {
+            "source": str((eval_cfg.get("metric_taxonomy") or {}).get("source", "legacy_builtin")),
+            "profile": str(metric_taxonomy_resolved.get("profile", "legacy_builtin")),
+            "path": (eval_cfg.get("metric_taxonomy") or {}).get("path"),
+        },
+        "non_regression": dict(non_regression_cfg),
         "phase_context": phase_context,
         "domain_counts": {
             "species_before": species_domain_counts_before,
@@ -3383,8 +5519,16 @@ def main() -> None:
                 "surface": int(selected.get("surface_species_after", 0)),
             },
             "selected_reactions_after": {
-                "gas": int(selected.get("gas_reactions_after", 0)),
-                "surface": int(selected.get("surface_reactions_after", 0)),
+                "gas": (
+                    None
+                    if selected.get("gas_reactions_after") is None
+                    else int(selected.get("gas_reactions_after", 0))
+                ),
+                "surface": (
+                    None
+                    if selected.get("surface_reactions_after") is None
+                    else int(selected.get("surface_reactions_after", 0))
+                ),
             },
         },
         "gate_evidence": {
@@ -3460,15 +5604,61 @@ def main() -> None:
             "hard_ban_violations": int(selected.get("pooling_hard_ban_violations", 0)),
             "graph_kind": str(selected_pool_metrics.get("graph_kind", "")),
             "model_type": str((selected_pool_metrics.get("model_info") or {}).get("model_type", "")),
+            "candidate_count": int(selected.get("pooling_candidate_count", selected_pool_metrics.get("candidate_count", 0))),
+            "candidate_unique_count": int(
+                selected.get("pooling_candidate_unique_count", selected_pool_metrics.get("candidate_unique_count", 0))
+            ),
+            "candidate_selected_backend": str(
+                selected.get("pooling_candidate_selected_backend", selected_pool_metrics.get("candidate_selected_backend", ""))
+            ),
+            "candidate_selected_source": str(
+                selected.get("pooling_candidate_selected_source", selected_pool_metrics.get("candidate_selected_source", "backend"))
+            ),
+            "candidate_selected_coverage_proxy": float(
+                selected.get(
+                    "pooling_candidate_selected_coverage_proxy",
+                    selected_pool_metrics.get("candidate_selected_coverage_proxy", 0.0),
+                )
+            ),
+            "candidate_selected_dynamics_recon_error": float(
+                selected.get(
+                    "pooling_candidate_selected_dynamics_recon_error",
+                    selected_pool_metrics.get("candidate_selected_dynamics_recon_error", 0.0),
+                )
+            ),
+            "candidate_selected_max_cluster_size_ratio": float(
+                selected.get(
+                    "pooling_candidate_selected_max_cluster_size_ratio",
+                    selected_pool_metrics.get("candidate_selected_max_cluster_size_ratio", 0.0),
+                )
+            ),
+            "candidate_scores": list(
+                selected.get("pooling_candidate_scores", selected_pool_metrics.get("candidate_scores", [])) or []
+            ),
             "selected_stage": selected_stage_name,
             "mapping_fallback_enabled": bool(pooling_mapping_fallback_enabled),
             "mapping_fallback_triggered": bool(pooling_mapping_fallback_reasons),
             "mapping_fallback_reasons": pooling_mapping_fallback_reasons,
+            "bridge_enabled": bool(pooling_bridge_enabled),
+            "bridge_mode": str(pooling_bridge_mode_cfg),
         }
         summary_payload["pooling_artifact_path"] = str(
             pooling_stage_artifacts.get(selected_stage_name, selected.get("pooling_artifact_path") or "")
         )
 
+    diagnostic_schema_ok = validate_summary_schema(
+        summary_payload,
+        strict=bool(contract_cfg.get("diagnostic_schema_strict", False)),
+    )
+    if not diagnostic_schema_ok and not bool(contract_cfg.get("diagnostic_schema_strict", False)):
+        print("[WARN] diagnostic schema missing keys", file=sys.stderr)
+    summary_payload["diagnostic_schema_ok"] = bool(diagnostic_schema_ok)
+    summary_payload["selected_metrics"]["diagnostic_schema_ok"] = bool(diagnostic_schema_ok)
+    summary_payload["gate_evidence"]["selected_stage_evidence"]["diagnostic_schema_ok"] = bool(
+        diagnostic_schema_ok
+    )
+
+    runtime_guard.check("before_write_report")
     write_report(
         report_dir,
         run_id=args.run_id,
@@ -3476,8 +5666,10 @@ def main() -> None:
         selected_stage=str(selected["stage"]),
         summary_payload=summary_payload,
     )
+    runtime_guard.mark_progress("report_written")
 
     print(json.dumps(summary_payload, ensure_ascii=False, indent=2))
+    runtime_guard.release()
 
 
 if __name__ == "__main__":

@@ -13,3 +13,27 @@ def test_projection_reduces_violation() -> None:
 
     assert after <= before + 1.0e-12
     assert after < 1.0e-8
+
+
+def test_projection_pinv_precompute_is_numerically_stable() -> None:
+    rng = np.random.default_rng(7)
+    A = rng.normal(size=(4, 10))
+    X = rng.normal(size=(50, 10))
+    ref = X[0].copy()
+
+    projected = project_to_conservation(X, A, reference=ref, clip_nonnegative=False, max_iter=3)
+
+    gram = A @ A.T
+    legacy = np.asarray(X, dtype=float).copy()
+    target = A @ ref
+    for t in range(legacy.shape[0]):
+        x = legacy[t]
+        for _ in range(3):
+            resid = (A @ x) - target
+            if float(np.max(np.abs(resid))) < 1.0e-12:
+                break
+            delta = np.linalg.pinv(gram) @ resid
+            x = x - A.T @ delta
+        legacy[t] = x
+
+    assert np.max(np.abs(projected - legacy)) <= 1.0e-10

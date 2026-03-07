@@ -350,6 +350,114 @@ def coverage_aware_postselect(
     }
 
 
+def post_prune_refine(
+    *,
+    keep: np.ndarray,
+    importance: np.ndarray,
+    nu_cand: np.ndarray,
+    min_keep_count: int,
+    min_active_clusters: int,
+    coverage_post_cfg: dict[str, Any],
+    cfg: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    keep_arr = np.asarray(keep, dtype=bool).copy()
+    imp = np.asarray(importance, dtype=float)
+    nu_arr = np.asarray(nu_cand, dtype=float)
+    n_cand = int(keep_arr.shape[0])
+    if n_cand <= 0 or nu_arr.ndim != 2:
+        return keep_arr, {
+            "enabled": False,
+            "applied": False,
+            "steps": 0,
+            "dropped_total": 0,
+        }
+
+    enabled = bool(cfg.get("enabled", False))
+    if not enabled:
+        return keep_arr, {
+            "enabled": False,
+            "applied": False,
+            "steps": 0,
+            "dropped_total": 0,
+        }
+
+    max_steps = int(max(0, int(cfg.get("max_steps", 2))))
+    quantile_step = float(cfg.get("importance_quantile_step", 0.05) or 0.05)
+    quantile_step = float(np.clip(quantile_step, 0.0, 1.0))
+    respect_coverage = bool(cfg.get("respect_coverage_postselect", True))
+    respect_active = bool(cfg.get("respect_active_cluster_coverage", True))
+
+    min_keep = int(max(1, min(int(min_keep_count), n_cand)))
+    n_clusters = int(nu_arr.shape[0])
+    min_active = int(max(0, min(int(min_active_clusters), n_clusters)))
+
+    coverage_targets = dict(coverage_post_cfg or {})
+    target_weighted = float(np.clip(float(coverage_targets.get("target_weighted_coverage", 0.0)), 0.0, 1.0))
+    target_essential = float(np.clip(float(coverage_targets.get("target_essential_coverage", 0.0)), 0.0, 1.0))
+    cluster_weights = np.asarray(coverage_targets.get("cluster_weights") or np.ones((n_clusters,), dtype=float), dtype=float)
+    essential_mask = np.asarray(coverage_targets.get("essential_cluster_mask") or np.zeros((n_clusters,), dtype=bool), dtype=bool)
+
+    def _constraints_ok(mask: np.ndarray) -> bool:
+        if int(np.sum(mask)) < min_keep:
+            return False
+        if respect_active:
+            active = _active_cluster_mask(mask, nu_arr)
+            if int(np.sum(active)) < min_active:
+                return False
+        if respect_coverage:
+            weighted_cov, essential_cov = _coverage_metrics(mask, nu_arr, cluster_weights, essential_mask)
+            if weighted_cov + 1.0e-12 < target_weighted:
+                return False
+            if essential_cov + 1.0e-12 < target_essential:
+                return False
+        return True
+
+    keep_before = int(np.sum(keep_arr))
+    applied = False
+    steps = 0
+    dropped_total = 0
+
+    for _ in range(max_steps):
+        kept = np.where(keep_arr)[0]
+        if kept.size <= min_keep:
+            break
+        drop_budget = int(np.ceil(float(kept.size) * quantile_step))
+        drop_budget = max(1, min(drop_budget, int(kept.size) - min_keep))
+        if drop_budget <= 0:
+            break
+
+        removed_this_step = 0
+        for idx in sorted((int(x) for x in kept), key=lambda i: (float(imp[i]), i)):
+            if removed_this_step >= drop_budget:
+                break
+            trial = keep_arr.copy()
+            trial[idx] = False
+            if not _constraints_ok(trial):
+                continue
+            keep_arr = trial
+            removed_this_step += 1
+
+        if removed_this_step <= 0:
+            break
+        dropped_total += removed_this_step
+        steps += 1
+        applied = True
+
+    return keep_arr, {
+        "enabled": True,
+        "applied": bool(applied),
+        "steps": int(steps),
+        "dropped_total": int(dropped_total),
+        "keep_count_before": int(keep_before),
+        "keep_count_after": int(np.sum(keep_arr)),
+        "quantile_step": float(quantile_step),
+        "min_keep_count": int(min_keep),
+        "min_active_clusters": int(min_active),
+        "respect_coverage_postselect": bool(respect_coverage),
+        "respect_active_cluster_coverage": bool(respect_active),
+    }
+
+
 def select_sparse_overall(
     nu_cand: np.ndarray,
     ydot_target: np.ndarray,
@@ -455,9 +563,36 @@ def select_sparse_overall(
         max_steps=coverage_aware_swap_steps,
         max_keep_count=coverage_max_keep,
     )
-    active_clusters = int(active_cluster_meta.get("active_clusters", 0))
+    post_prune_cfg = dict((cfg or {}).get("post_prune_refine") or {})
+    keep, post_prune_meta = post_prune_refine(
+        keep=keep,
+        importance=importance,
+        nu_cand=nu_arr,
+        min_keep_count=min_keep_count_cfg,
+        min_active_clusters=min_active_clusters_cfg,
+        coverage_post_cfg=coverage_post_cfg,
+        cfg=post_prune_cfg,
+    )
+    active_mask_final = _active_cluster_mask(keep, nu_arr)
+    active_clusters = int(np.sum(active_mask_final))
     n_clusters = int(nu_arr.shape[0])
     active_cov = float(active_clusters) / float(max(1, n_clusters))
+    cluster_weights_final = np.asarray(
+        coverage_post_cfg.get("cluster_weights") or np.ones((n_clusters,), dtype=float),
+        dtype=float,
+    )
+    essential_mask_final = np.asarray(
+        coverage_post_cfg.get("essential_cluster_mask") or np.zeros((n_clusters,), dtype=bool),
+        dtype=bool,
+    )
+    weighted_cov_final, essential_cov_final = _coverage_metrics(
+        keep,
+        nu_arr,
+        cluster_weights_final,
+        essential_mask_final,
+    )
+    active_cluster_meta = dict(active_cluster_meta)
+    active_cluster_meta["active_clusters_after_post_prune"] = int(active_clusters)
 
     score: dict[str, Any] = {
         "status": status,
@@ -472,8 +607,9 @@ def select_sparse_overall(
         "active_cluster_coverage": active_cluster_meta,
         "active_species_coverage": float(active_cov),
         "min_active_clusters": int(max(0, min(min_active_clusters_cfg, n_clusters))),
-        "weighted_active_species_coverage": float(coverage_meta.get("weighted_coverage", 0.0)),
-        "essential_species_coverage": float(coverage_meta.get("essential_coverage", 1.0)),
+        "weighted_active_species_coverage": float(weighted_cov_final),
+        "essential_species_coverage": float(essential_cov_final),
+        "post_prune_refine": post_prune_meta,
         "importance": importance.tolist(),
         "rates_target": rates_target,
     }

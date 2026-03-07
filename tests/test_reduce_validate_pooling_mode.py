@@ -34,6 +34,11 @@ def test_reduce_validate_pooling_mode_runs(tmp_path) -> None:
     assert out["reduction_mode"] == "pooling"
     assert "pooling_metrics" in out
     assert "pooling_artifact_path" in out
+    assert "timing_total_s" in out
+    assert "runtime" in out
+    assert "config_hash" in out
+    assert "started_at" in out
+    assert "finished_at" in out
     pm = dict(out["pooling_metrics"])
     assert "overall_candidates" in pm
     assert "overall_selected" in pm
@@ -44,6 +49,11 @@ def test_reduce_validate_pooling_mode_runs(tmp_path) -> None:
     assert "pooling_hard_ban_violations" in selected
     assert "pooling_constraint_loss" in selected
     assert "pooling_artifact_path" in selected
+    assert "timing_stage_s" in selected
+    assert "timing_bridge_s" in selected
+    assert "timing_surrogate_eval_s" in selected
+    assert "timing_physical_gate_s" in selected
+    assert "timing_projection_s" in selected
 
     rt = dict(out.get("reduction_trace") or {})
     trend = list(rt.get("candidate_trend") or [])

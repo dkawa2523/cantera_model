@@ -150,6 +150,150 @@ def _max_cluster_size_ratio(S: np.ndarray) -> float:
     return float(np.max(sizes) / float(max(1, s.shape[0])))
 
 
+def _hard_ban_violations(S: np.ndarray, hard_mask: np.ndarray) -> int:
+    s = np.asarray(S, dtype=float)
+    hm = np.asarray(hard_mask, dtype=bool)
+    if s.ndim != 2 or hm.shape != (s.shape[0], s.shape[0]):
+        return 0
+    hard_viol = 0
+    for cidx in range(s.shape[1]):
+        members = np.where(s[:, cidx] > 0.5)[0]
+        for i_pos, i in enumerate(members):
+            for j in members[i_pos + 1 :]:
+                if not hm[i, j]:
+                    hard_viol += 1
+    return int(hard_viol)
+
+
+def _recompute_assignment_metrics(
+    *,
+    S: np.ndarray,
+    S_prob: np.ndarray,
+    hard_mask: np.ndarray,
+    pair_cost: np.ndarray,
+    species_weights: np.ndarray,
+    max_cluster_size_ratio: float,
+) -> dict[str, Any]:
+    max_cluster_ratio_obs = _max_cluster_size_ratio(S)
+    coverage_proxy = _cluster_coverage_proxy(S, species_weights)
+    hard_viol = _hard_ban_violations(S, hard_mask)
+    loss = pooling_constraint_loss(S_prob, hard_mask, pair_cost, {"hard_weight": 10.0, "soft_weight": 1.0})
+    cluster_guard_passed = float(max_cluster_ratio_obs) <= float(max_cluster_size_ratio) + 1.0e-12
+    return {
+        "constraint_loss": float(loss),
+        "hard_ban_violations": int(hard_viol),
+        "n_clusters": int(np.asarray(S).shape[1]),
+        "n_species": int(np.asarray(S).shape[0]),
+        "coverage_proxy": float(coverage_proxy),
+        "max_cluster_size_ratio": float(max_cluster_ratio_obs),
+        "max_cluster_size_ratio_limit": float(np.clip(max_cluster_size_ratio, 0.0, 1.0)),
+        "cluster_guard_passed": bool(cluster_guard_passed),
+    }
+
+
+def _refine_cluster_balance_swap(
+    *,
+    S: np.ndarray,
+    hard_mask: np.ndarray,
+    pair_cost: np.ndarray,
+    species_weights: np.ndarray,
+    max_cluster_size_ratio: float,
+    max_steps: int = 32,
+    min_coverage_improve: float = 1.0e-6,
+) -> dict[str, Any]:
+    s = np.asarray(S, dtype=float)
+    if s.ndim != 2 or s.shape[0] == 0 or s.shape[1] <= 1:
+        return {"improved": False, "S": s, "steps_applied": 0}
+    hm = np.asarray(hard_mask, dtype=bool)
+    pc = np.asarray(pair_cost, dtype=float)
+    w = np.maximum(np.asarray(species_weights, dtype=float), 0.0)
+    if hm.shape != (s.shape[0], s.shape[0]) or pc.shape != (s.shape[0], s.shape[0]):
+        return {"improved": False, "S": s, "steps_applied": 0}
+    if w.shape != (s.shape[0],):
+        w = np.ones((s.shape[0],), dtype=float)
+
+    current = np.asarray(s, dtype=float)
+    base_prob = np.asarray(current, dtype=float).copy()
+    base_metrics = _recompute_assignment_metrics(
+        S=current,
+        S_prob=base_prob,
+        hard_mask=hm,
+        pair_cost=pc,
+        species_weights=w,
+        max_cluster_size_ratio=max_cluster_size_ratio,
+    )
+    applied = 0
+    best_cov = float(base_metrics.get("coverage_proxy", _cluster_coverage_proxy(current, w)))
+    best_ratio = float(base_metrics.get("max_cluster_size_ratio", _max_cluster_size_ratio(current)))
+    best_loss = float(base_metrics.get("constraint_loss", 0.0))
+
+    for _ in range(max(0, int(max_steps))):
+        masses = np.asarray(current.T @ w, dtype=float)
+        donor = int(np.argmax(masses))
+        recipients = [int(x) for x in np.argsort(masses) if int(x) != donor]
+        donor_members = [int(i) for i in np.where(current[:, donor] > 0.5)[0]]
+        if len(donor_members) <= 1 or not recipients:
+            break
+
+        trial_best: np.ndarray | None = None
+        trial_cov = best_cov
+        trial_ratio = best_ratio
+        for member in sorted(donor_members, key=lambda idx: (-float(w[idx]), idx)):
+            for rec in recipients:
+                rec_members = [int(i) for i in np.where(current[:, rec] > 0.5)[0]]
+                if any(not bool(hm[member, j]) for j in rec_members):
+                    continue
+                cand = np.asarray(current, dtype=float).copy()
+                cand[member, donor] = 0.0
+                cand[member, rec] = 1.0
+                if int(np.sum(cand[:, donor] > 0.5)) <= 0:
+                    continue
+                cand_metrics = _recompute_assignment_metrics(
+                    S=cand,
+                    S_prob=np.asarray(cand, dtype=float),
+                    hard_mask=hm,
+                    pair_cost=pc,
+                    species_weights=w,
+                    max_cluster_size_ratio=max_cluster_size_ratio,
+                )
+                cand_ratio = float(cand_metrics.get("max_cluster_size_ratio", 1.0e9))
+                if not bool(cand_metrics.get("cluster_guard_passed", False)):
+                    continue
+                if int(cand_metrics.get("hard_ban_violations", 1)) > 0:
+                    continue
+                cand_loss = float(cand_metrics.get("constraint_loss", 0.0))
+                if cand_loss > best_loss + 1.0e-12:
+                    continue
+                cand_cov = float(cand_metrics.get("coverage_proxy", _cluster_coverage_proxy(cand, w)))
+                if cand_cov > trial_cov + 1.0e-12 or (
+                    abs(cand_cov - trial_cov) <= 1.0e-12 and cand_ratio < trial_ratio - 1.0e-12
+                ):
+                    trial_best = cand
+                    trial_cov = cand_cov
+                    trial_ratio = cand_ratio
+                    best_loss = cand_loss
+
+        if trial_best is None:
+            break
+        if trial_cov < best_cov + float(min_coverage_improve) - 1.0e-12:
+            break
+        current = trial_best
+        best_cov = trial_cov
+        best_ratio = trial_ratio
+        applied += 1
+
+    return {
+        "improved": bool(applied > 0 and best_cov >= _cluster_coverage_proxy(s, w) + float(min_coverage_improve) - 1.0e-12),
+        "S": current,
+        "steps_applied": int(applied),
+        "coverage_proxy_before": float(base_metrics.get("coverage_proxy", _cluster_coverage_proxy(s, w))),
+        "coverage_proxy_after": float(best_cov),
+        "constraint_loss_before": float(base_metrics.get("constraint_loss", 0.0)),
+        "constraint_loss_after": float(best_loss),
+        "max_cluster_size_ratio_after": float(best_ratio),
+    }
+
+
 def _repair_max_cluster_size(
     S: np.ndarray,
     species_weights: np.ndarray,
@@ -264,17 +408,17 @@ def train_pooling_assignment(
     if s_prob.shape[1] != S.shape[1]:
         s_prob = np.asarray(S, dtype=float).copy()
 
-    hard_viol = 0
-    for cidx in range(S.shape[1]):
-        members = np.where(S[:, cidx] > 0.5)[0]
-        for i_pos, i in enumerate(members):
-            for j in members[i_pos + 1 :]:
-                if not hard_mask[i, j]:
-                    hard_viol += 1
-
-    loss = pooling_constraint_loss(s_prob, hard_mask, pair_cost, c.get("constraints"))
-
-    cluster_guard_passed = float(max_cluster_ratio_obs) <= float(max_cluster_size_ratio) + 1.0e-12
+    metrics_core = _recompute_assignment_metrics(
+        S=S,
+        S_prob=s_prob,
+        hard_mask=hard_mask,
+        pair_cost=pair_cost,
+        species_weights=species_weights,
+        max_cluster_size_ratio=max_cluster_size_ratio,
+    )
+    hard_viol = int(metrics_core.get("hard_ban_violations", 0))
+    loss = float(metrics_core.get("constraint_loss", 0.0))
+    cluster_guard_passed = bool(metrics_core.get("cluster_guard_passed", True))
 
     return {
         "S": S,

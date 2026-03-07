@@ -36,6 +36,7 @@ def project_to_conservation(
 
     b = A_mat @ ref
     gram = A_mat @ A_mat.T
+    gram_pinv = np.linalg.pinv(gram)
 
     out = arr.copy()
     for t in range(out.shape[0]):
@@ -44,7 +45,7 @@ def project_to_conservation(
             resid = (A_mat @ x) - b
             if float(np.max(np.abs(resid))) < 1.0e-12:
                 break
-            delta = np.linalg.pinv(gram) @ resid
+            delta = gram_pinv @ resid
             x = x - A_mat.T @ delta
             if clip_nonnegative:
                 x = np.maximum(x, 0.0)
