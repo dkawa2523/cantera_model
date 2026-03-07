@@ -1,0 +1,22 @@
+profiles:
+  large_default_v1:
+    family_exact:
+      T_max: T
+      T_last: T
+      ignition_delay: ignition_delay
+    family_prefix:
+      "X_last:": X_last
+      "X_max:": X_max
+      "X_int:": X_int
+      "dep_int:": dep_int
+    species_token:
+      delimiter: ":"
+      take: after_first
+    metric_family_abs_floor:
+      X_last: 1.0e-9
+      X_max: 1.0e-12
+      X_int: 1.0e-10
+      dep_int: 1.0e-10
+      T: 1.0e-3
+      ignition_delay: 1.0e-6
+      default: 1.0e-12

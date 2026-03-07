@@ -45,8 +45,35 @@ def _default_metric_keys(qoi_cfg: dict[str, Any]) -> list[str]:
     species_max = list(qoi_cfg.get("species_max") or [])
     species_integral = list(qoi_cfg.get("species_integral") or [])
     deposition_integral = list(qoi_cfg.get("deposition_integral") or [])
+    builtin_cfg = dict(qoi_cfg.get("qoi_builtin_metrics") or {})
+    include_temperature_metrics = bool(builtin_cfg.get("include_temperature_metrics", True))
+    include_ignition_delay = bool(builtin_cfg.get("include_ignition_delay", True))
 
-    keys = ["ignition_delay", "T_max", "T_last"]
+    keys: list[str] = []
+    if include_ignition_delay:
+        keys.append("ignition_delay")
+    if include_temperature_metrics:
+        keys.extend(["T_max", "T_last"])
+    keys.extend([f"X_last:{sp}" for sp in species_last])
+    keys.extend([f"X_max:{sp}" for sp in species_max])
+    keys.extend([f"X_int:{sp}" for sp in species_integral])
+    keys.extend([f"dep_int:{sp}" for sp in deposition_integral])
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(key)
+    return uniq
+
+
+def _explicit_qoi_metric_keys(qoi_cfg: dict[str, Any]) -> list[str]:
+    species_last = [str(x) for x in list(qoi_cfg.get("species_last") or []) if str(x)]
+    species_max = [str(x) for x in list(qoi_cfg.get("species_max") or []) if str(x)]
+    species_integral = [str(x) for x in list(qoi_cfg.get("species_integral") or []) if str(x)]
+    deposition_integral = [str(x) for x in list(qoi_cfg.get("deposition_integral") or []) if str(x)]
+    keys: list[str] = []
     keys.extend([f"X_last:{sp}" for sp in species_last])
     keys.extend([f"X_max:{sp}" for sp in species_max])
     keys.extend([f"X_int:{sp}" for sp in species_integral])
@@ -277,7 +304,52 @@ def compare_with_baseline(
     baseline_rows: list[dict[str, Any]],
     surrogate_rows: list[dict[str, Any]],
     eval_cfg: dict[str, Any],
+    qoi_cfg: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], EvalSummary]:
+    validity_cfg = dict(eval_cfg.get("gate_metric_validity") or {})
+    tiers_cfg = dict(eval_cfg.get("gate_metric_tiers") or {})
+    qoi_cfg_local = dict(qoi_cfg or {})
+    mandatory_metrics = [str(x) for x in list(tiers_cfg.get("mandatory") or []) if str(x)]
+    mandatory_prefixes = [str(x) for x in list(tiers_cfg.get("mandatory_prefixes") or []) if str(x)]
+    if not mandatory_metrics and not mandatory_prefixes:
+        mandatory_metrics = _explicit_qoi_metric_keys(qoi_cfg_local)
+    eval_policy = {
+        "error_aggregation": dict(eval_cfg.get("error_aggregation") or {}),
+        "metric_normalization": dict(eval_cfg.get("metric_normalization") or {}),
+        "metric_taxonomy": dict(eval_cfg.get("metric_taxonomy_resolved") or eval_cfg.get("metric_taxonomy") or {}),
+        "evaluation_contract_version": str(((eval_cfg.get("contract") or {}).get("version") or "")),
+        "metric_taxonomy_profile_effective": str(
+            ((eval_cfg.get("metric_taxonomy") or {}).get("profile") or "legacy_builtin")
+        ),
+        "diagnostic_schema_ok": True,
+        "optional_metrics": [str(x) for x in list(tiers_cfg.get("optional") or []) if str(x)],
+        "optional_prefixes": [str(x) for x in list(tiers_cfg.get("optional_prefixes") or []) if str(x)],
+    }
+    mandatory_validity = {
+        "mandatory_metrics": mandatory_metrics,
+        "mandatory_prefixes": mandatory_prefixes,
+        "mandatory_hard_mode": str(validity_cfg.get("mandatory_hard_mode", "hard_block_if_invalid")),
+        "min_valid_mandatory_count_abs": int(validity_cfg.get("min_valid_mandatory_count_abs", 1) or 1),
+        "min_valid_mandatory_ratio": float(validity_cfg.get("min_valid_mandatory_ratio", 1.0) or 1.0),
+        "min_valid_mandatory_cap_by_total": bool(validity_cfg.get("min_valid_mandatory_cap_by_total", True)),
+        "mandatory_metric_validity_mode": str(validity_cfg.get("mandatory_metric_validity_mode", "case_pass_rate")),
+        "mandatory_metric_case_pass_min": validity_cfg.get("mandatory_metric_case_pass_min"),
+        "mandatory_valid_unit_mode": str(
+            validity_cfg.get("mandatory_valid_unit_mode", "species_family_quorum")
+        ),
+        "mandatory_validity_basis": str(
+            validity_cfg.get("mandatory_validity_basis", "coverage_evaluable")
+        ),
+        "mandatory_species_family_score_mode": str(
+            validity_cfg.get("mandatory_species_family_score_mode", "uniform")
+        ),
+        "mandatory_species_family_case_pass_min": float(
+            validity_cfg.get("mandatory_species_family_case_pass_min", 0.67) or 0.67
+        ),
+        "mandatory_gate_unit_min_evaluable_case_ratio_shadow": float(
+            validity_cfg.get("mandatory_gate_unit_min_evaluable_case_ratio_shadow", 0.25) or 0.25
+        ),
+    }
     rel_eps = float(eval_cfg.get("rel_eps", 1.0e-12))
     rel_tolerance = float(eval_cfg.get("rel_tolerance", 0.2))
 
@@ -286,6 +358,8 @@ def compare_with_baseline(
         surrogate_rows,
         rel_eps=rel_eps,
         rel_tolerance=rel_tolerance,
+        mandatory_validity=mandatory_validity,
+        eval_policy=eval_policy,
     )
 
     out = EvalSummary(
@@ -299,5 +373,229 @@ def compare_with_baseline(
         worst_case=summary.get("worst_case"),
         rel_tolerance=rel_tolerance,
         rel_eps=rel_eps,
+        mandatory_total_metric_count=int(summary.get("mandatory_total_metric_count") or 0),
+        valid_mandatory_metric_count=int(summary.get("valid_mandatory_metric_count") or 0),
+        min_valid_mandatory_count_effective=int(summary.get("min_valid_mandatory_count_effective") or 0),
+        mandatory_validity_passed=bool(summary.get("mandatory_validity_passed", True)),
+        invalid_mandatory_metric_count=int(summary.get("invalid_mandatory_metric_count") or 0),
+        inactive_mandatory_metric_count=int(summary.get("inactive_mandatory_metric_count") or 0),
+        active_invalid_mandatory_metric_count=int(summary.get("active_invalid_mandatory_metric_count") or 0),
+        active_invalid_mandatory_gate_unit_keys=[
+            str(x) for x in list(summary.get("active_invalid_mandatory_gate_unit_keys") or [])
+        ],
+        mandatory_metric_case_pass_rates={
+            str(k): float(v) for k, v in dict(summary.get("mandatory_metric_case_pass_rates") or {}).items()
+        },
+        mandatory_gate_unit_case_pass_rates={
+            str(k): float(v) for k, v in dict(summary.get("mandatory_gate_unit_case_pass_rates") or {}).items()
+        },
+        mandatory_gate_unit_mode_effective=str(
+            summary.get("mandatory_gate_unit_mode_effective") or "species_family_quorum"
+        ),
+        mandatory_species_family_score_mode_effective=str(
+            summary.get("mandatory_species_family_score_mode_effective") or "uniform"
+        ),
+        mandatory_quality_scope_effective=str(
+            summary.get("mandatory_quality_scope_effective") or "valid_only"
+        ),
+        mandatory_tail_scope_effective=str(
+            summary.get("mandatory_tail_scope_effective") or "quality_scope"
+        ),
+        mandatory_total_gate_unit_count=int(summary.get("mandatory_total_gate_unit_count") or 0),
+        valid_mandatory_gate_unit_count=int(summary.get("valid_mandatory_gate_unit_count") or 0),
+        mandatory_quality_gate_unit_count=int(summary.get("mandatory_quality_gate_unit_count") or 0),
+        mandatory_quality_metric_count=int(summary.get("mandatory_quality_metric_count") or 0),
+        mandatory_species_family_case_pass_min_effective=(
+            None
+            if summary.get("mandatory_species_family_case_pass_min_effective") is None
+            else float(summary.get("mandatory_species_family_case_pass_min_effective"))
+        ),
+        mandatory_metric_validity_mode_effective=str(
+            summary.get("mandatory_metric_validity_mode_effective") or "case_pass_rate"
+        ),
+        mandatory_validity_basis_effective=str(
+            summary.get("mandatory_validity_basis_effective") or "coverage_evaluable"
+        ),
+        mandatory_gate_unit_evaluable_case_rates={
+            str(k): float(v)
+            for k, v in dict(summary.get("mandatory_gate_unit_evaluable_case_rates") or {}).items()
+        },
+        valid_mandatory_gate_unit_count_coverage=int(
+            summary.get("valid_mandatory_gate_unit_count_coverage")
+            if summary.get("valid_mandatory_gate_unit_count_coverage") is not None
+            else summary.get("valid_mandatory_gate_unit_count") or 0
+        ),
+        valid_mandatory_gate_unit_count_case_rate=int(
+            summary.get("valid_mandatory_gate_unit_count_case_rate")
+            if summary.get("valid_mandatory_gate_unit_count_case_rate") is not None
+            else summary.get("valid_mandatory_gate_unit_count") or 0
+        ),
+        mandatory_gate_unit_valid_count_shadow_evaluable_ratio=int(
+            summary.get("mandatory_gate_unit_valid_count_shadow_evaluable_ratio")
+            if summary.get("mandatory_gate_unit_valid_count_shadow_evaluable_ratio") is not None
+            else 0
+        ),
+        mandatory_gate_unit_min_evaluable_case_ratio_shadow_effective=(
+            None
+            if summary.get("mandatory_gate_unit_min_evaluable_case_ratio_shadow_effective") is None
+            else float(summary.get("mandatory_gate_unit_min_evaluable_case_ratio_shadow_effective"))
+        ),
+        pass_rate_mandatory_case=float(summary.get("pass_rate_mandatory_case") or 0.0),
+        pass_rate_mandatory_case_all_units=float(summary.get("pass_rate_mandatory_case_all_units") or 0.0),
+        pass_rate_mandatory_case_all_required=float(summary.get("pass_rate_mandatory_case_all_required") or 0.0),
+        pass_rate_mandatory_case_ratio_mean=float(summary.get("pass_rate_mandatory_case_ratio_mean") or 0.0),
+        pass_rate_mandatory_case_all_required_all_units=float(
+            summary.get("pass_rate_mandatory_case_all_required_all_units") or 0.0
+        ),
+        pass_rate_mandatory_case_ratio_mean_all_units=float(
+            summary.get("pass_rate_mandatory_case_ratio_mean_all_units") or 0.0
+        ),
+        mandatory_case_unit_weight_mode_effective=str(
+            summary.get("mandatory_case_unit_weight_mode_effective") or "uniform"
+        ),
+        pass_rate_optional_case=float(summary.get("pass_rate_optional_case") or 0.0),
+        pass_rate_optional_metric_mean=float(summary.get("pass_rate_optional_metric_mean") or 0.0),
+        pass_rate_all_metric_legacy=float(summary.get("pass_rate_all_metric_legacy", summary.get("pass_rate") or 0.0) or 0.0),
+        mean_rel_diff_mandatory=(
+            None if summary.get("mean_rel_diff_mandatory") is None else float(summary.get("mean_rel_diff_mandatory"))
+        ),
+        mean_rel_diff_mandatory_all_units=(
+            None
+            if summary.get("mean_rel_diff_mandatory_all_units") is None
+            else float(summary.get("mean_rel_diff_mandatory_all_units"))
+        ),
+        mean_rel_diff_mandatory_raw=(
+            None
+            if summary.get("mean_rel_diff_mandatory_raw") is None
+            else float(summary.get("mean_rel_diff_mandatory_raw"))
+        ),
+        mean_rel_diff_mandatory_family_weighted=(
+            None
+            if summary.get("mean_rel_diff_mandatory_family_weighted") is None
+            else float(summary.get("mean_rel_diff_mandatory_family_weighted"))
+        ),
+        mean_rel_diff_mandatory_winsorized=(
+            None
+            if summary.get("mean_rel_diff_mandatory_winsorized") is None
+            else float(summary.get("mean_rel_diff_mandatory_winsorized"))
+        ),
+        mandatory_rel_outlier_ratio=(
+            None
+            if summary.get("mandatory_rel_outlier_ratio") is None
+            else float(summary.get("mandatory_rel_outlier_ratio"))
+        ),
+        mandatory_rel_outlier_ratio_all_units=(
+            None
+            if summary.get("mandatory_rel_outlier_ratio_all_units") is None
+            else float(summary.get("mandatory_rel_outlier_ratio_all_units"))
+        ),
+        mandatory_rel_outlier_ratio_max_effective=(
+            None
+            if summary.get("mandatory_rel_outlier_ratio_max_effective") is None
+            else float(summary.get("mandatory_rel_outlier_ratio_max_effective"))
+        ),
+        mandatory_rel_diff_p95=(
+            None if summary.get("mandatory_rel_diff_p95") is None else float(summary.get("mandatory_rel_diff_p95"))
+        ),
+        mandatory_rel_diff_p95_all_units=(
+            None
+            if summary.get("mandatory_rel_diff_p95_all_units") is None
+            else float(summary.get("mandatory_rel_diff_p95_all_units"))
+        ),
+        mandatory_tail_guard_passed=bool(summary.get("mandatory_tail_guard_passed", True)),
+        mandatory_tail_guard_triggered=bool(summary.get("mandatory_tail_guard_triggered", False)),
+        mandatory_tail_guard_hard_applied=bool(summary.get("mandatory_tail_guard_hard_applied", False)),
+        mandatory_tail_guard_mode_effective=str(
+            summary.get("mandatory_tail_guard_mode_effective") or "p95"
+        ),
+        mandatory_tail_guard_policy_effective=str(
+            summary.get("mandatory_tail_guard_policy_effective") or "conditional_hard"
+        ),
+        mandatory_tail_activation_ratio_min_effective=(
+            None
+            if summary.get("mandatory_tail_activation_ratio_min_effective") is None
+            else float(summary.get("mandatory_tail_activation_ratio_min_effective"))
+        ),
+        mandatory_tail_exceed_ref_effective=str(
+            summary.get("mandatory_tail_exceed_ref_effective") or "tail_max"
+        ),
+        mandatory_tail_exceed_ratio=(
+            None
+            if summary.get("mandatory_tail_exceed_ratio") is None
+            else float(summary.get("mandatory_tail_exceed_ratio"))
+        ),
+        mandatory_tail_rel_diff_max_effective=(
+            None
+            if summary.get("mandatory_tail_rel_diff_max_effective") is None
+            else float(summary.get("mandatory_tail_rel_diff_max_effective"))
+        ),
+        mandatory_quality_scope_empty=bool(summary.get("mandatory_quality_scope_empty", False)),
+        mandatory_metric_valid_case_pass_min_effective=(
+            None
+            if summary.get("mandatory_metric_valid_case_pass_min_effective") is None
+            else float(summary.get("mandatory_metric_valid_case_pass_min_effective"))
+        ),
+        mean_rel_diff_optional=(
+            None if summary.get("mean_rel_diff_optional") is None else float(summary.get("mean_rel_diff_optional"))
+        ),
+        mean_rel_diff_all_metric_legacy=(
+            None
+            if summary.get("mean_rel_diff_all_metric_legacy") is None
+            else float(summary.get("mean_rel_diff_all_metric_legacy"))
+        ),
+        coverage_gate_passed=bool(summary.get("coverage_gate_passed", summary.get("mandatory_validity_passed", True))),
+        mandatory_quality_passed=bool(summary.get("mandatory_quality_passed", summary.get("mandatory_error_passed", True))),
+        optional_quality_passed=bool(summary.get("optional_quality_passed", summary.get("optional_error_passed", True))),
+        mandatory_error_passed=bool(summary.get("mandatory_error_passed", True)),
+        optional_error_passed=bool(summary.get("optional_error_passed", True)),
+        error_fail_reason_primary=str(summary.get("error_fail_reason_primary") or "none"),
+        mandatory_error_include_validity_effective=bool(
+            summary.get("mandatory_error_include_validity_effective", False)
+        ),
+        error_gate_score=float(summary.get("error_gate_score") or 0.0),
+        effective_metric_count=int(summary.get("effective_metric_count") or 0),
+        suppressed_low_signal_metric_count=int(summary.get("suppressed_low_signal_metric_count") or 0),
+        error_gate_passed=bool(summary.get("error_gate_passed", True)),
+        mandatory_case_mode_effective=str(summary.get("mandatory_case_mode_effective") or "ratio_mean"),
+        mandatory_mean_aggregation_effective=str(summary.get("mandatory_mean_aggregation_effective") or "raw"),
+        mandatory_mean_mode_effective=str(summary.get("mandatory_mean_mode_effective") or "winsorized"),
+        compression_refine_applied=(
+            None if summary.get("compression_refine_applied") is None else bool(summary.get("compression_refine_applied"))
+        ),
+        compression_refine_trials=(
+            None if summary.get("compression_refine_trials") is None else int(summary.get("compression_refine_trials"))
+        ),
+        compression_refine_reaction_delta=(
+            None
+            if summary.get("compression_refine_reaction_delta") is None
+            else int(summary.get("compression_refine_reaction_delta"))
+        ),
+        compression_refine_species_delta=(
+            None
+            if summary.get("compression_refine_species_delta") is None
+            else int(summary.get("compression_refine_species_delta"))
+        ),
+        compression_refine_mode_effective=(
+            None
+            if summary.get("compression_refine_mode_effective") in {None, ""}
+            else str(summary.get("compression_refine_mode_effective"))
+        ),
+        compression_refine_guard_passed=(
+            None
+            if summary.get("compression_refine_guard_passed") is None
+            else bool(summary.get("compression_refine_guard_passed"))
+        ),
+        mode_collapse_warning=(
+            None if summary.get("mode_collapse_warning") is None else bool(summary.get("mode_collapse_warning"))
+        ),
+        evaluation_contract_version=(
+            None
+            if summary.get("evaluation_contract_version") in {None, ""}
+            else str(summary.get("evaluation_contract_version"))
+        ),
+        metric_taxonomy_profile_effective=str(
+            summary.get("metric_taxonomy_profile_effective") or "legacy_builtin"
+        ),
+        diagnostic_schema_ok=bool(summary.get("diagnostic_schema_ok", True)),
     )
     return cmp_rows, out
